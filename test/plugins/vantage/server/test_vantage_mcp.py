@@ -180,6 +180,7 @@ class VantageMcpTest(unittest.TestCase):
         self.assertEqual("connected", response["result"]["structuredContent"]["status"])
         self.assertIn("Restart Codex", serialized)
         self.assertIn("trust the Vantage hooks", serialized)
+        self.assertIn("rerun setup to refresh the copied hook scripts", serialized)
         self.assertNotIn(secret, serialized)
         self.assertNotIn(authorization_url, serialized)
         self.assertNotIn("private-verifier", serialized)
@@ -214,6 +215,10 @@ class VantageMcpTest(unittest.TestCase):
         self.assertTrue(result["structuredContent"]["restart_required"])
         self.assertIn("Restart Codex", result["content"][0]["text"])
         self.assertIn("trust the Vantage hooks", result["content"][0]["text"])
+        self.assertIn(
+            "rerun setup to refresh the copied hook scripts",
+            result["content"][0]["text"],
+        )
 
     def test_connect_returns_immediately_and_does_not_start_duplicate_setup(self):
         process = FakeProcess(pending=True)
@@ -348,6 +353,30 @@ class VantageMcpTest(unittest.TestCase):
         self.assertEqual("not_configured", result["structuredContent"]["status"])
         self.assertFalse(result["structuredContent"]["restart_required"])
 
+    def test_remove_reports_removed_when_hooks_were_removed_but_configuration_is_unmanaged(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "Removed Vantage hooks from ~/.codex/hooks.json.\n"
+                "The Vantage configuration is not managed by the plugin, so its telemetry settings were left unchanged."
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            response = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "remove_vantage_telemetry", "arguments": {}},
+                )
+            )
+
+        result = response["result"]
+        self.assertEqual("removed", result["structuredContent"]["status"])
+        self.assertTrue(result["structuredContent"]["restart_required"])
+
     def test_failed_setup_does_not_return_captured_output(self):
         process = FakeProcess(
             returncode=2,
@@ -378,6 +407,30 @@ class VantageMcpTest(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertNotIn("private.example", serialized)
         self.assertNotIn("secret-token", serialized)
+
+    def test_hook_install_failure_is_actionable_and_sanitized(self):
+        process = FakeProcess(
+            returncode=5,
+            stdout="Vantage telemetry is configured.",
+            stderr="private hook parsing details",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            MODULE.handle_message(
+                request(1, "tools/call", {"name": "connect_vantage_telemetry", "arguments": {}})
+            )
+            response = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {"name": "check_vantage_telemetry_setup", "arguments": {"wait_seconds": 0}},
+                )
+            )
+
+        serialized = json.dumps(response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("hooks could not be installed safely", serialized)
+        self.assertNotIn("private hook parsing details", serialized)
 
     def test_tools_reject_arguments_and_unknown_names(self):
         arguments = MODULE.handle_message(
