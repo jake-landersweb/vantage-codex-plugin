@@ -1,0 +1,433 @@
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import unittest
+from unittest import mock
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+SCRIPT = ROOT / "plugins/vantage/server/vantage_mcp.py"
+LAUNCHER = ROOT / "plugins/vantage/server/run_vantage_mcp.sh"
+SPEC = importlib.util.spec_from_file_location("vantage_mcp", SCRIPT)
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+def request(message_id, method, params=None):
+    payload = {"jsonrpc": "2.0", "id": message_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    return payload
+
+
+class FakeProcess:
+    def __init__(self, returncode=0, stdout="", stderr="", pending=False):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pending = pending
+        self.communicate_timeouts = []
+        self.terminated = False
+
+    def communicate(self, timeout=None):
+        self.communicate_timeouts.append(timeout)
+        if self.pending:
+            raise subprocess.TimeoutExpired([], timeout)
+        return self.stdout, self.stderr
+
+    def poll(self):
+        return None if self.pending else self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.pending = False
+
+    def kill(self):
+        self.terminated = True
+        self.pending = False
+
+    def wait(self, timeout=None):
+        if self.pending:
+            raise subprocess.TimeoutExpired([], timeout)
+        return self.returncode
+
+
+class VantageMcpTest(unittest.TestCase):
+    def setUp(self):
+        MODULE._ACTIVE_SETUP = None
+        MODULE._LAST_SETUP_OUTCOME = None
+
+    def test_server_runs_over_stdio_without_extra_output(self):
+        messages = [
+            request(1, "initialize", {"protocolVersion": MODULE.PROTOCOL_VERSION}),
+            request(2, "tools/list"),
+        ]
+
+        environment = os.environ.copy()
+        environment.pop("PLUGIN_ROOT", None)
+        environment.update(
+            {
+                "VANTAGE_CODEX_PYTHON": sys.executable,
+            }
+        )
+        completed = subprocess.run(
+            ["sh", str(LAUNCHER)],
+            input="".join(json.dumps(message) + "\n" for message in messages),
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(0, completed.returncode)
+        self.assertEqual("", completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual([1, 2], [response["id"] for response in responses])
+        self.assertEqual(
+            "connect_vantage_telemetry",
+            responses[1]["result"]["tools"][0]["name"],
+        )
+
+    def test_launcher_reports_a_missing_python_interpreter(self):
+        environment = os.environ.copy()
+        environment.pop("PLUGIN_ROOT", None)
+        environment.update(
+            {
+                "VANTAGE_CODEX_PYTHON": str(ROOT / "missing-python"),
+            }
+        )
+
+        completed = subprocess.run(
+            ["sh", str(LAUNCHER)],
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(4, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("requires Python 3", completed.stderr)
+
+    def test_negotiates_legacy_protocol_and_lists_deterministic_tools(self):
+        messages = [
+            request(1, "server/discover"),
+            request(2, "initialize", {"protocolVersion": "2026-07-28"}),
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            request(3, "tools/list"),
+        ]
+        input_stream = io.BytesIO(
+            b"".join((json.dumps(message) + "\n").encode("utf-8") for message in messages)
+        )
+        output_stream = io.BytesIO()
+
+        MODULE.serve(input_stream, output_stream)
+
+        responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+        self.assertEqual(-32601, responses[0]["error"]["code"])
+        self.assertEqual(MODULE.PROTOCOL_VERSION, responses[1]["result"]["protocolVersion"])
+        self.assertEqual("vantage-local", responses[1]["result"]["serverInfo"]["name"])
+        self.assertEqual(3, responses[2]["id"])
+        tools = responses[2]["result"]["tools"]
+        self.assertEqual(
+            [
+                "connect_vantage_telemetry",
+                "check_vantage_telemetry_setup",
+                "remove_vantage_telemetry",
+            ],
+            [tool["name"] for tool in tools],
+        )
+        self.assertFalse(tools[0]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools[1]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools[2]["annotations"]["destructiveHint"])
+
+    def test_connect_tool_returns_only_sanitized_output(self):
+        secret = "vntg_ti_PRIVATE_CREDENTIAL"
+        authorization_url = "https://console.vantage.sh/codex/telemetry/authorize?secret=value"
+        process = FakeProcess(
+            stdout="Configured with %s at %s" % (secret, authorization_url),
+            stderr="code_verifier=private-verifier",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            started = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "connect_vantage_telemetry", "arguments": {}},
+                )
+            )
+            response = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {
+                        "name": "check_vantage_telemetry_setup",
+                        "arguments": {"wait_seconds": 0},
+                    },
+                )
+            )
+
+        serialized = json.dumps(response)
+        self.assertEqual("pending", started["result"]["structuredContent"]["status"])
+        self.assertEqual("connected", response["result"]["structuredContent"]["status"])
+        self.assertIn("Restart Codex", serialized)
+        self.assertIn("trust the Vantage hooks", serialized)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(authorization_url, serialized)
+        self.assertNotIn("private-verifier", serialized)
+
+    def test_existing_connection_still_requests_a_restart(self):
+        process = FakeProcess(
+            stdout="Vantage telemetry is already configured.",
+            stderr="",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "connect_vantage_telemetry", "arguments": {}},
+                )
+            )
+            response = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {
+                        "name": "check_vantage_telemetry_setup",
+                        "arguments": {"wait_seconds": 0},
+                    },
+                )
+            )
+
+        result = response["result"]
+        self.assertEqual("already_connected", result["structuredContent"]["status"])
+        self.assertTrue(result["structuredContent"]["restart_required"])
+        self.assertIn("Restart Codex", result["content"][0]["text"])
+        self.assertIn("trust the Vantage hooks", result["content"][0]["text"])
+
+    def test_connect_returns_immediately_and_does_not_start_duplicate_setup(self):
+        process = FakeProcess(pending=True)
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process) as popen:
+            first = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "connect_vantage_telemetry", "arguments": {}},
+                )
+            )
+            second = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {"name": "connect_vantage_telemetry", "arguments": {}},
+                )
+            )
+
+        self.assertEqual("pending", first["result"]["structuredContent"]["status"])
+        self.assertEqual("pending", second["result"]["structuredContent"]["status"])
+        popen.assert_called_once()
+        self.assertEqual([0], process.communicate_timeouts)
+
+    def test_status_wait_is_bounded_and_reports_pending(self):
+        process = FakeProcess(pending=True)
+        MODULE._ACTIVE_SETUP = process
+
+        response = MODULE.handle_message(
+            request(
+                1,
+                "tools/call",
+                {
+                    "name": "check_vantage_telemetry_setup",
+                    "arguments": {"wait_seconds": 45},
+                },
+            )
+        )
+
+        self.assertEqual("pending", response["result"]["structuredContent"]["status"])
+        self.assertEqual([45], process.communicate_timeouts)
+
+    def test_cancellation_notification_stops_active_setup(self):
+        process = FakeProcess(pending=True)
+        MODULE._ACTIVE_SETUP = process
+
+        response = MODULE.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 1, "reason": "user cancelled"},
+            }
+        )
+        status = MODULE.handle_message(
+            request(
+                2,
+                "tools/call",
+                {
+                    "name": "check_vantage_telemetry_setup",
+                    "arguments": {"wait_seconds": 0},
+                },
+            )
+        )
+
+        self.assertIsNone(response)
+        self.assertTrue(process.terminated)
+        self.assertIsNone(MODULE._ACTIVE_SETUP)
+        self.assertEqual("cancelled", status["result"]["structuredContent"]["status"])
+
+    def test_late_cancellation_preserves_completed_setup_result(self):
+        process = FakeProcess(stdout="Configured Vantage telemetry.")
+        MODULE._ACTIVE_SETUP = process
+
+        MODULE.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 1},
+            }
+        )
+        status = MODULE.handle_message(
+            request(
+                2,
+                "tools/call",
+                {
+                    "name": "check_vantage_telemetry_setup",
+                    "arguments": {"wait_seconds": 0},
+                },
+            )
+        )
+
+        self.assertFalse(process.terminated)
+        self.assertEqual("connected", status["result"]["structuredContent"]["status"])
+
+    def test_remove_tool_passes_only_the_remove_flag(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="Removed", stderr="")
+
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            response = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "remove_vantage_telemetry", "arguments": {}},
+                )
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(sys.executable, command[0])
+        self.assertEqual(str(MODULE.SETUP_SCRIPT), command[1])
+        self.assertEqual("--remove", command[2])
+        self.assertEqual("removed", response["result"]["structuredContent"]["status"])
+
+    def test_remove_reports_unmanaged_configuration_as_unchanged(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="The Vantage configuration is not managed by the plugin. No changes were made.",
+            stderr="",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            response = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "remove_vantage_telemetry", "arguments": {}},
+                )
+            )
+
+        result = response["result"]
+        self.assertEqual("not_configured", result["structuredContent"]["status"])
+        self.assertFalse(result["structuredContent"]["restart_required"])
+
+    def test_failed_setup_does_not_return_captured_output(self):
+        process = FakeProcess(
+            returncode=2,
+            stdout="https://private.example/authorize",
+            stderr="Bearer secret-token",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "connect_vantage_telemetry", "arguments": {}},
+                )
+            )
+            response = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {
+                        "name": "check_vantage_telemetry_setup",
+                        "arguments": {"wait_seconds": 0},
+                    },
+                )
+            )
+
+        serialized = json.dumps(response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertNotIn("private.example", serialized)
+        self.assertNotIn("secret-token", serialized)
+
+    def test_tools_reject_arguments_and_unknown_names(self):
+        arguments = MODULE.handle_message(
+            request(
+                1,
+                "tools/call",
+                {"name": "connect_vantage_telemetry", "arguments": {"token": "no"}},
+            )
+        )
+        unknown = MODULE.handle_message(
+            request(2, "tools/call", {"name": "unknown", "arguments": {}})
+        )
+        wait = MODULE.handle_message(
+            request(
+                3,
+                "tools/call",
+                {
+                    "name": "check_vantage_telemetry_setup",
+                    "arguments": {"wait_seconds": 46},
+                },
+            )
+        )
+
+        self.assertEqual(-32602, arguments["error"]["code"])
+        self.assertEqual(-32601, unknown["error"]["code"])
+        self.assertEqual(-32602, wait["error"]["code"])
+
+    def test_plugin_versions_stay_in_sync(self):
+        manifest = json.loads(
+            (ROOT / "plugins/vantage/plugin.json").read_text(encoding="utf-8")
+        )
+        hook = (ROOT / "plugins/vantage/hooks/vantage_codex_hook.py").read_text(
+            encoding="utf-8"
+        )
+        setup = (
+            ROOT
+            / "plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
+        ).read_text(encoding="utf-8")
+
+        expected = 'PLUGIN_VERSION = "%s"' % manifest["version"]
+        self.assertIn(expected, hook)
+        self.assertIn(expected, setup)
+
+        mcp = json.loads((ROOT / "plugins/vantage/mcp.json").read_text(encoding="utf-8"))
+        server = mcp["mcpServers"]["vantage_local"]
+        self.assertEqual("stdio", server["type"])
+        self.assertEqual("sh", server["command"])
+        self.assertEqual(["${PLUGIN_ROOT}/server/run_vantage_mcp.sh"], server["args"])
+        self.assertEqual("${PLUGIN_ROOT}", server["cwd"])
+
+
+if __name__ == "__main__":
+    unittest.main()
