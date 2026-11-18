@@ -118,6 +118,22 @@ exporter = {{ otlp-http = {{ endpoint = "{HOOK.INGEST_ENDPOINT}", headers = {{ a
             "vntg_ti_EXISTING_CREDENTIAL", deliver.call_args.kwargs["token"]
         )
 
+    def test_delivers_attribution_with_the_plugin_user_agent(self):
+        with mock.patch.object(
+            HOOK.urllib.request,
+            "urlopen",
+            return_value=mock.Mock(status=200),
+        ) as urlopen:
+            HOOK.deliver(
+                {"resourceLogs": []},
+                token="vntg_ti_TEST_CREDENTIAL",
+                endpoint="https://ingest.vantage.sh",
+                stderr=io.StringIO(),
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(HOOK.USER_AGENT, request.get_header("User-agent"))
+
     def test_session_start_does_not_read_the_telemetry_config(self):
         output = io.StringIO()
 

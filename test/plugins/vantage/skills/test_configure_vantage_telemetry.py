@@ -88,8 +88,21 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
         self.assertEqual("secret-token", token)
         sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
-        request_payload = json.loads(urlopen.call_args_list[0].args[0].data)
+        request = urlopen.call_args_list[0].args[0]
+        request_payload = json.loads(request.data)
         self.assertEqual(authorization_expires_at, request_payload["authorization_expires_at"])
+        self.assertEqual(MODULE.USER_AGENT, request.get_header("User-agent"))
+
+    def test_verifies_ingest_token_with_the_plugin_user_agent(self):
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            return_value=Response(200, {}),
+        ) as urlopen:
+            MODULE.verify_ingest_token("secret-token")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(MODULE.USER_AGENT, request.get_header("User-agent"))
 
     def test_backs_off_while_authorization_is_pending(self):
         responses = [

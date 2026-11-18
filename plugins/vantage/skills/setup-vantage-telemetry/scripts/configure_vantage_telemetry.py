@@ -26,6 +26,8 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
 )
+PLUGIN_VERSION = "0.2.0"
+USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
@@ -190,7 +192,11 @@ def wait_for_ingest_token(code_verifier, authorization_expires_at):
                     "authorization_expires_at": authorization_expires_at,
                 }
             ).encode("utf-8"),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             method="POST",
         )
         try:
@@ -235,6 +241,7 @@ def verify_ingest_token(token):
                 "Accept": "application/json",
                 "Authorization": "Bearer %s" % token,
                 "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
             },
             method="POST",
         )

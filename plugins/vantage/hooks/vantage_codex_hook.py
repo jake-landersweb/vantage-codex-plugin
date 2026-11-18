@@ -22,6 +22,8 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1"
+PLUGIN_VERSION = "0.2.0"
+USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 EVENT_NAME = "codex.turn.attribution"
 PURPOSES = ("research", "development", "design", "unclassified")
 SOURCES = ("explicit", "inferred", "manual")
@@ -154,6 +156,7 @@ def deliver(
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )
