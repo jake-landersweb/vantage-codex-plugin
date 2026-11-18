@@ -24,6 +24,18 @@ Start a new Codex session after installation so Codex reloads the plugin and its
 
 After editing the plugin, run `./bin/install-local` again to refresh the installed copy.
 
+## Install from GitHub
+
+Vantage developers with access to the private repository can install the published
+marketplace directly:
+
+```sh
+codex plugin marketplace add vantage-sh/vantage-plugins
+codex plugin add vantage@vantage-plugins
+```
+
+Use the checkout-based installation above while actively developing the plugin.
+
 ## Layout
 
 - `.agents/plugins/marketplace.json` declares the local marketplace.
