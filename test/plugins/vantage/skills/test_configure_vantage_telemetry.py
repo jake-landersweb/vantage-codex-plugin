@@ -38,6 +38,9 @@ class Response:
 
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
+    def authorization_expires_at(self):
+        return int(MODULE.time.time()) + MODULE.AUTHORIZATION_TIMEOUT
+
     def run_main(self, config=""):
         with tempfile.TemporaryDirectory() as codex_home:
             path = pathlib.Path(codex_home) / "config.toml"
@@ -55,8 +58,9 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             return status, stdout.getvalue(), stderr.getvalue(), result
 
     def test_browser_sign_in_uses_no_localhost_callback(self):
-        with mock.patch.object(MODULE.webbrowser, "open", return_value=True) as browser_open:
-            verifier = MODULE.browser_sign_in()
+        with mock.patch.object(MODULE.time, "time", return_value=1_000):
+            with mock.patch.object(MODULE.webbrowser, "open", return_value=True) as browser_open:
+                verifier, authorization_expires_at = MODULE.browser_sign_in()
 
         authorization_url = browser_open.call_args.args[0]
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(authorization_url).query)
@@ -66,6 +70,8 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
         self.assertEqual([expected_challenge], query["code_challenge"])
         self.assertEqual(["S256"], query["code_challenge_method"])
+        self.assertEqual([str(authorization_expires_at)], query["authorization_expires_at"])
+        self.assertEqual(1_000 + MODULE.AUTHORIZATION_TIMEOUT, authorization_expires_at)
         self.assertNotIn("redirect_uri", query)
         self.assertNotIn("state", query)
 
@@ -75,12 +81,15 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             Response(201, {"plaintext_token": "secret-token"}),
         ]
 
-        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses) as urlopen:
             with mock.patch.object(MODULE.time, "sleep") as sleep:
-                token = MODULE.wait_for_ingest_token("v" * 64)
+                authorization_expires_at = self.authorization_expires_at()
+                token = MODULE.wait_for_ingest_token("v" * 64, authorization_expires_at)
 
         self.assertEqual("secret-token", token)
         sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
+        request_payload = json.loads(urlopen.call_args_list[0].args[0].data)
+        self.assertEqual(authorization_expires_at, request_payload["authorization_expires_at"])
 
     def test_backs_off_while_authorization_is_pending(self):
         responses = [
@@ -92,7 +101,7 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
         with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
             with mock.patch.object(MODULE.time, "sleep") as sleep:
-                token = MODULE.wait_for_ingest_token("v" * 64)
+                token = MODULE.wait_for_ingest_token("v" * 64, self.authorization_expires_at())
 
         self.assertEqual("secret-token", token)
         self.assertEqual(
@@ -112,7 +121,7 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
         with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
             with mock.patch.object(MODULE.time, "sleep") as sleep:
-                token = MODULE.wait_for_ingest_token("v" * 64)
+                token = MODULE.wait_for_ingest_token("v" * 64, self.authorization_expires_at())
 
         self.assertEqual("secret-token", token)
         sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
@@ -140,7 +149,11 @@ exporter = { otlp-http = { endpoint = "https://ingest.vantage.sh/v1/logs", heade
 trace_exporter = "none"
 """
 
-        with mock.patch.object(MODULE, "browser_sign_in", return_value="verifier"):
+        with mock.patch.object(
+            MODULE,
+            "browser_sign_in",
+            return_value=("verifier", self.authorization_expires_at()),
+        ):
             with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
                 with mock.patch.object(MODULE, "verify_ingest_token"):
                     status, stdout, stderr, result = self.run_main(config)
@@ -161,7 +174,11 @@ trace_exporter = "none"
         self.assertIn('trace_exporter = "none"', result)
 
     def test_default_command_configures_telemetry(self):
-        with mock.patch.object(MODULE, "browser_sign_in", return_value="verifier"):
+        with mock.patch.object(
+            MODULE,
+            "browser_sign_in",
+            return_value=("verifier", self.authorization_expires_at()),
+        ):
             with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
                 with mock.patch.object(MODULE, "verify_ingest_token"):
                     status, stdout, stderr, result = self.run_main()

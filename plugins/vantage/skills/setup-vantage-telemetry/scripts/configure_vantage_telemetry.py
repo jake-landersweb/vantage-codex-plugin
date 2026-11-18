@@ -21,12 +21,12 @@ BEGIN = "# BEGIN Vantage telemetry (managed by the Vantage plugin; rerun setup t
 END = "# END Vantage telemetry"
 INGEST_ENDPOINT = os.environ.get("VANTAGE_CODEX_INGEST_ENDPOINT", "https://ingest.vantage.sh/v1/logs")
 CLAIM_ENDPOINT = os.environ.get(
-    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.vantage.sh/internal/codex_telemetry_setup/claim"
+    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.vantage.sh/plugins/codex_telemetry_setup/claim"
 )
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
 )
-AUTHORIZATION_TIMEOUT = 600
+AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
 REQUEST_TIMEOUT = max(1, min(300, float(os.environ.get("VANTAGE_CODEX_REQUEST_TIMEOUT", "15"))))
@@ -155,10 +155,12 @@ def browser_sign_in():
     code_verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    authorization_expires_at = int(time.time()) + AUTHORIZATION_TIMEOUT
     query = urllib.parse.urlencode(
         {
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
+            "authorization_expires_at": authorization_expires_at,
         }
     )
     authorization_url = "%s?%s" % (AUTHORIZATION_ENDPOINT, query)
@@ -166,16 +168,28 @@ def browser_sign_in():
     print("Opening Vantage to sign in and connect Codex telemetry...")
     if not webbrowser.open(authorization_url, new=1):
         print("Open this URL to continue:\n%s" % authorization_url)
-    return code_verifier
+    return code_verifier, authorization_expires_at
 
 
-def wait_for_ingest_token(code_verifier):
-    deadline = time.monotonic() + AUTHORIZATION_TIMEOUT
+def wait_for_ingest_token(code_verifier, authorization_expires_at):
+    remaining = authorization_expires_at - time.time()
+    if remaining <= 0:
+        raise ValueError("Vantage sign-in timed out. Start setup again.")
+
+    deadline = time.monotonic() + remaining
     poll_interval = POLL_INTERVAL
     while True:
+        if time.monotonic() >= deadline:
+            raise ValueError("Vantage sign-in timed out. Start setup again.")
+
         request = urllib.request.Request(
             CLAIM_ENDPOINT,
-            data=json.dumps({"code_verifier": code_verifier}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "code_verifier": code_verifier,
+                    "authorization_expires_at": authorization_expires_at,
+                }
+            ).encode("utf-8"),
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             method="POST",
         )
@@ -310,8 +324,8 @@ def main():
             )
             return 3
         try:
-            code_verifier = browser_sign_in()
-            token = wait_for_ingest_token(code_verifier)
+            code_verifier, authorization_expires_at = browser_sign_in()
+            token = wait_for_ingest_token(code_verifier, authorization_expires_at)
             verify_ingest_token(token)
         except ValueError as error:
             print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
@@ -337,8 +351,8 @@ def main():
         print("Next step: remove or change the conflicting OpenTelemetry settings, then run this command again.", file=sys.stderr)
         return 3
     try:
-        code_verifier = browser_sign_in()
-        token = wait_for_ingest_token(code_verifier)
+        code_verifier, authorization_expires_at = browser_sign_in()
+        token = wait_for_ingest_token(code_verifier, authorization_expires_at)
         verify_ingest_token(token)
     except ValueError as error:
         print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
