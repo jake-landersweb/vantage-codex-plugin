@@ -257,6 +257,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
 
             with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
                 MODULE.install_user_hooks()
+                installed = pathlib.Path(codex_home) / "vantage" / "hooks"
+                for name in MODULE.HOOK_SCRIPT_NAMES:
+                    (installed / name).write_bytes(b"stale hook script")
                 MODULE.install_user_hooks()
                 payload = json.loads(hooks_path.read_text(encoding="utf-8"))
                 self.assertEqual(existing["hooks"]["PostToolUse"], payload["hooks"]["PostToolUse"])
@@ -270,7 +273,6 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     ]
                     self.assertEqual(1, len(managed))
 
-            installed = pathlib.Path(codex_home) / "vantage" / "hooks"
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 destination = installed / name
                 self.assertEqual(
@@ -298,6 +300,32 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             self.assertNotIn("SessionStart", payload["hooks"])
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 self.assertFalse((pathlib.Path(codex_home) / "vantage" / "hooks" / name).exists())
+
+    def test_remove_reports_removed_hooks_when_configuration_is_unmanaged(self):
+        config = """[otel]
+exporter = { otlp-http = { endpoint = "https://ingest.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
+"""
+
+        with tempfile.TemporaryDirectory() as codex_home:
+            config_path = pathlib.Path(codex_home) / "config.toml"
+            hooks_path = pathlib.Path(codex_home) / "hooks.json"
+            config_path.write_text(config, encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                MODULE.install_user_hooks()
+                with mock.patch.object(sys, "argv", [str(SCRIPT), "--remove"]):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        status = MODULE.main()
+
+            self.assertEqual(0, status)
+            self.assertIn("Removed Vantage hooks", stdout.getvalue())
+            self.assertIn("telemetry settings were left unchanged", stdout.getvalue())
+            self.assertNotIn("No changes were made", stdout.getvalue())
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual(config, config_path.read_text(encoding="utf-8"))
+            self.assertFalse(hooks_path.exists())
 
     def test_invalid_user_hooks_are_not_overwritten(self):
         with tempfile.TemporaryDirectory() as codex_home:

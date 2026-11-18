@@ -51,4 +51,5 @@ repository contains only code that is installed and executed on a Codex user's m
 Telemetry setup merges Vantage's `SessionStart` and `Stop` handlers into the user's
 `~/.codex/hooks.json`, copies their scripts to `~/.codex/vantage/hooks`, and preserves
 unrelated user hooks. Removing Vantage telemetry removes only those managed entries and
-copied scripts.
+copied scripts. Workspace users should rerun Vantage telemetry setup after every plugin
+update so the copied hook scripts are refreshed from the newly installed plugin version.

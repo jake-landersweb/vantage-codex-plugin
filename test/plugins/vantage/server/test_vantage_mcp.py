@@ -180,6 +180,7 @@ class VantageMcpTest(unittest.TestCase):
         self.assertEqual("connected", response["result"]["structuredContent"]["status"])
         self.assertIn("Restart Codex", serialized)
         self.assertIn("trust the Vantage hooks", serialized)
+        self.assertIn("rerun setup to refresh the copied hook scripts", serialized)
         self.assertNotIn(secret, serialized)
         self.assertNotIn(authorization_url, serialized)
         self.assertNotIn("private-verifier", serialized)
@@ -214,6 +215,10 @@ class VantageMcpTest(unittest.TestCase):
         self.assertTrue(result["structuredContent"]["restart_required"])
         self.assertIn("Restart Codex", result["content"][0]["text"])
         self.assertIn("trust the Vantage hooks", result["content"][0]["text"])
+        self.assertIn(
+            "rerun setup to refresh the copied hook scripts",
+            result["content"][0]["text"],
+        )
 
     def test_connect_returns_immediately_and_does_not_start_duplicate_setup(self):
         process = FakeProcess(pending=True)
@@ -347,6 +352,30 @@ class VantageMcpTest(unittest.TestCase):
         result = response["result"]
         self.assertEqual("not_configured", result["structuredContent"]["status"])
         self.assertFalse(result["structuredContent"]["restart_required"])
+
+    def test_remove_reports_removed_when_hooks_were_removed_but_configuration_is_unmanaged(self):
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "Removed Vantage hooks from ~/.codex/hooks.json.\n"
+                "The Vantage configuration is not managed by the plugin, so its telemetry settings were left unchanged."
+            ),
+            stderr="",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            response = MODULE.handle_message(
+                request(
+                    1,
+                    "tools/call",
+                    {"name": "remove_vantage_telemetry", "arguments": {}},
+                )
+            )
+
+        result = response["result"]
+        self.assertEqual("removed", result["structuredContent"]["status"])
+        self.assertTrue(result["structuredContent"]["restart_required"])
 
     def test_failed_setup_does_not_return_captured_output(self):
         process = FakeProcess(

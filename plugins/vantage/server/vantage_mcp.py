@@ -66,13 +66,15 @@ def outcome_from_completed(action, completed):
             return SetupOutcome(
                 "already_connected",
                 "Vantage telemetry is already connected. Review and trust the Vantage "
-                "hooks in /hooks or Settings > Hooks. Restart Codex, then start a new chat.",
+                "hooks in /hooks or Settings > Hooks. Restart Codex, then start a new chat. "
+                "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
                 True,
             )
         return SetupOutcome(
             "connected",
             "Vantage telemetry is connected. Review and trust the Vantage hooks in "
-            "/hooks or Settings > Hooks. Restart Codex, then start a new chat.",
+            "/hooks or Settings > Hooks. Restart Codex, then start a new chat. "
+            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
             True,
         )
 

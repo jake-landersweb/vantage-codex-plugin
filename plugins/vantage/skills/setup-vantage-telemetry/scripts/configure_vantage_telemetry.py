@@ -228,7 +228,7 @@ def install_user_hooks_or_report():
     except (OSError, UnicodeError, ValueError) as error:
         print("Vantage telemetry is configured, but its hooks could not be installed: %s" % error, file=sys.stderr)
         return False
-    print("Installed Vantage hooks in %s." % path)
+    print("Installed or refreshed Vantage hooks in %s." % path)
     return True
 
 
@@ -499,7 +499,14 @@ def main():
             return 5
         if not configured:
             if existing_vantage_token:
-                print("The Vantage configuration in %s is not managed by the plugin. No changes were made." % path)
+                if removed_hooks:
+                    print("Removed Vantage hooks from %s." % user_hooks_path())
+                    print(
+                        "The Vantage configuration in %s is not managed by the plugin, so its telemetry settings were left unchanged."
+                        % path
+                    )
+                else:
+                    print("The Vantage configuration in %s is not managed by the plugin. No changes were made." % path)
             elif removed_hooks:
                 print("Removed Vantage hooks from %s." % user_hooks_path())
             else:
