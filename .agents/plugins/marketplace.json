@@ -1,0 +1,19 @@
+{
+  "name": "vantage-plugins",
+  "interface": {
+    "displayName": "Vantage Plugins"
+  },
+  "plugins": [
+    {
+      "name": "vantage",
+      "source": {
+        "source": "local",
+        "path": "./plugins/vantage"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

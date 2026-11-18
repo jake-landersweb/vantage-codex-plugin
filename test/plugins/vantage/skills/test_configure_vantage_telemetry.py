@@ -1,0 +1,193 @@
+import base64
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import urllib.parse
+import unittest
+from unittest import mock
+
+
+SCRIPT = (
+    pathlib.Path(__file__).parents[4]
+    / "plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
+)
+SPEC = importlib.util.spec_from_file_location("configure_vantage_telemetry", SCRIPT)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class Response:
+    def __init__(self, status, payload):
+        self.status = status
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class ConfigureVantageTelemetryTest(unittest.TestCase):
+    def run_main(self, config=""):
+        with tempfile.TemporaryDirectory() as codex_home:
+            path = pathlib.Path(codex_home) / "config.toml"
+            if config:
+                path.write_text(config, encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                with mock.patch.object(sys, "argv", [str(SCRIPT)]):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        status = MODULE.main()
+
+            result = path.read_text(encoding="utf-8") if path.exists() else ""
+            return status, stdout.getvalue(), stderr.getvalue(), result
+
+    def test_browser_sign_in_uses_no_localhost_callback(self):
+        with mock.patch.object(MODULE.webbrowser, "open", return_value=True) as browser_open:
+            verifier = MODULE.browser_sign_in()
+
+        authorization_url = browser_open.call_args.args[0]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(authorization_url).query)
+        expected_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode("ascii")).digest()
+        ).decode("ascii").rstrip("=")
+
+        self.assertEqual([expected_challenge], query["code_challenge"])
+        self.assertEqual(["S256"], query["code_challenge_method"])
+        self.assertNotIn("redirect_uri", query)
+        self.assertNotIn("state", query)
+
+    def test_waits_until_vantage_returns_the_ingest_token(self):
+        responses = [
+            Response(202, {"status": "pending"}),
+            Response(201, {"plaintext_token": "secret-token"}),
+        ]
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                token = MODULE.wait_for_ingest_token("v" * 64)
+
+        self.assertEqual("secret-token", token)
+        sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
+
+    def test_backs_off_while_authorization_is_pending(self):
+        responses = [
+            Response(202, {"status": "pending"}),
+            Response(202, {"status": "pending"}),
+            Response(202, {"status": "pending"}),
+            Response(201, {"plaintext_token": "secret-token"}),
+        ]
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                token = MODULE.wait_for_ingest_token("v" * 64)
+
+        self.assertEqual("secret-token", token)
+        self.assertEqual(
+            [mock.call(2), mock.call(4), mock.call(8)],
+            sleep.call_args_list,
+        )
+
+    def test_retries_rate_limited_polling_with_backoff(self):
+        rate_limited = MODULE.urllib.error.HTTPError(
+            MODULE.CLAIM_ENDPOINT,
+            429,
+            "Too Many Requests",
+            {},
+            None,
+        )
+        responses = [rate_limited, Response(201, {"plaintext_token": "secret-token"})]
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                token = MODULE.wait_for_ingest_token("v" * 64)
+
+        self.assertEqual("secret-token", token)
+        sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
+
+    def test_default_command_stops_when_plugin_configuration_exists(self):
+        config = "[otel]\n%s\n" % "\n".join(MODULE.managed_block("existing-token", True))
+
+        with mock.patch.object(MODULE, "browser_sign_in") as browser_sign_in:
+            status, stdout, stderr, result = self.run_main(config)
+
+        self.assertEqual(0, status)
+        self.assertIn("already configured", stdout)
+        self.assertIn("Next steps:", stdout)
+        self.assertEqual("", stderr)
+        self.assertEqual(config, result)
+        browser_sign_in.assert_not_called()
+
+    def test_default_command_refreshes_an_existing_vantage_exporter(self):
+        config = """[otel]
+log_user_prompt = true
+log_agent_responses = true
+log_guardian_assessments = true
+tool_result = { max_bytes = 1048576 }
+exporter = { otlp-http = { endpoint = "https://ingest.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
+trace_exporter = "none"
+"""
+
+        with mock.patch.object(MODULE, "browser_sign_in", return_value="verifier"):
+            with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
+                with mock.patch.object(MODULE, "verify_ingest_token"):
+                    status, stdout, stderr, result = self.run_main(config)
+
+        self.assertEqual(0, status)
+        self.assertIn("Refreshed Vantage telemetry", stdout)
+        self.assertIn("Next steps:", stdout)
+        self.assertEqual("", stderr)
+        self.assertIn('authorization = "Bearer new-token"', result)
+        self.assertNotIn("existing-token", result)
+        self.assertIn("# BEGIN Vantage telemetry", result)
+        self.assertIn("log_user_prompt = false", result)
+        self.assertIn("log_agent_responses = false", result)
+        self.assertIn("log_guardian_assessments = false", result)
+        self.assertIn("tool_result = { max_bytes = 0 }", result)
+        self.assertNotIn("log_user_prompt = true", result)
+        self.assertNotIn("log_agent_responses = true", result)
+        self.assertIn('trace_exporter = "none"', result)
+
+    def test_default_command_configures_telemetry(self):
+        with mock.patch.object(MODULE, "browser_sign_in", return_value="verifier"):
+            with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
+                with mock.patch.object(MODULE, "verify_ingest_token"):
+                    status, stdout, stderr, result = self.run_main()
+
+        self.assertEqual(0, status)
+        self.assertIn("Configured Vantage telemetry", stdout)
+        self.assertIn("Next steps:", stdout)
+        self.assertEqual("", stderr)
+        self.assertIn("[otel]", result)
+        self.assertIn('authorization = "Bearer new-token"', result)
+
+    def test_default_command_reports_a_conflicting_exporter(self):
+        config = """[otel]
+exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
+"""
+
+        with mock.patch.object(MODULE, "browser_sign_in") as browser_sign_in:
+            status, stdout, stderr, result = self.run_main(config)
+
+        self.assertEqual(3, status)
+        self.assertEqual("", stdout)
+        self.assertIn("No changes were made", stderr)
+        self.assertIn("run this command again", stderr)
+        self.assertEqual(config, result)
+        browser_sign_in.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,28 @@
+#!/bin/sh
+
+set -eu
+
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+marketplace_name=vantage-plugins
+plugin_selector=vantage@vantage-plugins
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Codex CLI was not found on PATH." >&2
+  exit 1
+fi
+
+if codex plugin list 2>/dev/null | grep -q "^${plugin_selector}[[:space:]]"; then
+  codex plugin remove "$plugin_selector"
+fi
+
+if codex plugin marketplace list 2>/dev/null | grep -q "^${marketplace_name}[[:space:]]"; then
+  codex plugin marketplace remove "$marketplace_name"
+fi
+
+codex plugin marketplace add "$repository_root"
+codex plugin add "$plugin_selector"
+
+echo
+echo "Installed ${plugin_selector} from ${repository_root}."
+echo "Start a new Codex session to reload the plugin and hooks."
+codex plugin marketplace list
