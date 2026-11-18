@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 import time
@@ -153,6 +154,25 @@ def managed_block(token, include_environment):
     return lines
 
 
+def open_authorization_url(authorization_url):
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["open", authorization_url],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0
+
+    try:
+        return webbrowser.open(authorization_url, new=1)
+    except webbrowser.Error:
+        return False
+
+
 def browser_sign_in():
     code_verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
@@ -167,9 +187,8 @@ def browser_sign_in():
     )
     authorization_url = "%s?%s" % (AUTHORIZATION_ENDPOINT, query)
 
-    print("Opening Vantage to sign in and connect Codex telemetry...")
-    if not webbrowser.open(authorization_url, new=1):
-        print("Open this URL to continue:\n%s" % authorization_url)
+    if not open_authorization_url(authorization_url):
+        raise ValueError("Vantage sign-in could not be opened in your browser.")
     return code_verifier, authorization_expires_at
 
 
