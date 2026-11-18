@@ -1,14 +1,13 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "vantage",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Configure Codex usage telemetry and attribution for Vantage.",
   "author": {
     "name": "Vantage"
   },
   "extensions": {
     "com.openai": {
-      "hooks": "./hooks/hooks.json",
       "onboardingSkill": "./skills/setup-vantage-telemetry/SKILL.md",
       "requires_local_executor": true,
       "interface": {

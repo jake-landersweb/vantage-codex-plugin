@@ -81,6 +81,7 @@ def outcome_from_completed(action, completed):
         2: "Vantage sign-in or credential verification did not complete. Start setup again.",
         3: "Existing OpenTelemetry settings prevent automatic setup. Review your Codex telemetry configuration and retry.",
         4: "Vantage telemetry setup requires Python 3.",
+        5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
     }
     return SetupOutcome(
         "error",

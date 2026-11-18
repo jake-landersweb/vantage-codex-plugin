@@ -379,6 +379,30 @@ class VantageMcpTest(unittest.TestCase):
         self.assertNotIn("private.example", serialized)
         self.assertNotIn("secret-token", serialized)
 
+    def test_hook_install_failure_is_actionable_and_sanitized(self):
+        process = FakeProcess(
+            returncode=5,
+            stdout="Vantage telemetry is configured.",
+            stderr="private hook parsing details",
+        )
+
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            MODULE.handle_message(
+                request(1, "tools/call", {"name": "connect_vantage_telemetry", "arguments": {}})
+            )
+            response = MODULE.handle_message(
+                request(
+                    2,
+                    "tools/call",
+                    {"name": "check_vantage_telemetry_setup", "arguments": {"wait_seconds": 0}},
+                )
+            )
+
+        serialized = json.dumps(response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("hooks could not be installed safely", serialized)
+        self.assertNotIn("private hook parsing details", serialized)
+
     def test_tools_reject_arguments_and_unknown_names(self):
         arguments = MODULE.handle_message(
             request(

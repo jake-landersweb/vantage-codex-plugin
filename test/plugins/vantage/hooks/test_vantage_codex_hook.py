@@ -3,6 +3,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -284,6 +285,25 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
 
         self.assertEqual(0, result.returncode)
         self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_launcher_resolves_the_hook_without_plugin_root(self):
+        launcher = SCRIPT.parent / "run_vantage_codex_hook.sh"
+        environment = os.environ.copy()
+        environment.pop("PLUGIN_ROOT", None)
+        environment["VANTAGE_CODEX_PYTHON"] = sys.executable
+
+        result = subprocess.run(
+            ["sh", str(launcher)],
+            input=json.dumps({"hook_event_name": "SessionStart", "session_id": "session-1"}),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode)
+        self.assertIn("tag --session session-1", result.stdout)
         self.assertEqual("", result.stderr)
 
 

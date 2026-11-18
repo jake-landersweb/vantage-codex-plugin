@@ -6,8 +6,10 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,7 +29,7 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
@@ -44,11 +46,190 @@ TABLE = re.compile(r"^\s*\[")
 OTEL_TABLE = re.compile(r"^\s*\[\s*otel\s*\]\s*(?:#.*)?$")
 OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
+BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
+HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "vantage_codex_hook.py")
+
+
+def codex_home_path():
+    configured = os.environ.get("CODEX_HOME")
+    return pathlib.Path(configured or "~/.codex").expanduser()
 
 
 def config_path():
-    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    return os.path.join(codex_home, "config.toml")
+    return str(codex_home_path() / "config.toml")
+
+
+def user_hooks_path():
+    return codex_home_path() / "hooks.json"
+
+
+def managed_hooks_dir():
+    return codex_home_path() / "vantage" / "hooks"
+
+
+def hook_handler(event_name):
+    hooks_dir = managed_hooks_dir()
+    shell_script = hooks_dir / "run_vantage_codex_hook.sh"
+    python_script = hooks_dir / "vantage_codex_hook.py"
+    handler = {
+        "type": "command",
+        "command": "sh %s" % shlex.quote(str(shell_script)),
+        "commandWindows": subprocess.list2cmdline(["python", str(python_script)]),
+        "timeout": 30,
+        "statusMessage": (
+            "Loading Vantage attribution"
+            if event_name == "SessionStart"
+            else "Adding Vantage usage tags"
+        ),
+    }
+    if event_name == "Stop":
+        handler["async"] = True
+    return handler
+
+
+def is_managed_hook(handler):
+    if not isinstance(handler, dict):
+        return False
+    expected = hook_handler("SessionStart")
+    return (
+        handler.get("command") == expected["command"]
+        or handler.get("commandWindows") == expected["commandWindows"]
+    )
+
+
+def remove_managed_hook_handlers(groups):
+    if not isinstance(groups, list):
+        raise ValueError("a Vantage hook event is not a list")
+
+    result = []
+    changed = False
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            result.append(group)
+            continue
+        remaining = [handler for handler in group["hooks"] if not is_managed_hook(handler)]
+        if len(remaining) == len(group["hooks"]):
+            result.append(group)
+            continue
+        changed = True
+        if remaining:
+            updated = dict(group)
+            updated["hooks"] = remaining
+            result.append(updated)
+    return result, changed
+
+
+def load_user_hooks():
+    path = user_hooks_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("%s could not be read safely" % path) from error
+    if not isinstance(payload, dict):
+        raise ValueError("%s must contain a JSON object" % path)
+    hooks = payload.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        raise ValueError("the hooks value in %s must be a JSON object" % path)
+    return payload
+
+
+def write_file(path, content, mode=0o600):
+    path = pathlib.Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".%s." % path.name)
+    try:
+        with os.fdopen(handle, "wb") as output:
+            output.write(content)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
+def write_user_hooks(payload):
+    content = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    write_file(user_hooks_path(), content)
+
+
+def copy_managed_hook_scripts():
+    destination = managed_hooks_dir()
+    for name in HOOK_SCRIPT_NAMES:
+        source = BUNDLED_HOOKS_DIR / name
+        write_file(destination / name, source.read_bytes(), mode=0o700)
+
+
+def install_user_hooks():
+    payload = load_user_hooks()
+    hooks = dict(payload.get("hooks") or {})
+    for event_name in ("SessionStart", "Stop"):
+        groups, _changed = remove_managed_hook_handlers(hooks.get(event_name, []))
+        groups.append({"hooks": [hook_handler(event_name)]})
+        hooks[event_name] = groups
+    payload["hooks"] = hooks
+
+    copy_managed_hook_scripts()
+    write_user_hooks(payload)
+    return user_hooks_path()
+
+
+def remove_managed_hook_scripts():
+    changed = False
+    directory = managed_hooks_dir()
+    for name in HOOK_SCRIPT_NAMES:
+        path = directory / name
+        try:
+            path.unlink()
+            changed = True
+        except FileNotFoundError:
+            pass
+    for path in (directory, directory.parent):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    return changed
+
+
+def remove_user_hooks():
+    path = user_hooks_path()
+    payload = load_user_hooks()
+    hooks = dict(payload.get("hooks") or {})
+    changed = False
+    for event_name in ("SessionStart", "Stop"):
+        if event_name not in hooks:
+            continue
+        groups, event_changed = remove_managed_hook_handlers(hooks[event_name])
+        changed = changed or event_changed
+        if groups:
+            hooks[event_name] = groups
+        else:
+            hooks.pop(event_name, None)
+
+    if changed:
+        if hooks:
+            payload["hooks"] = hooks
+        else:
+            payload.pop("hooks", None)
+        if payload:
+            write_user_hooks(payload)
+        else:
+            path.unlink(missing_ok=True)
+    return remove_managed_hook_scripts() or changed
+
+
+def install_user_hooks_or_report():
+    try:
+        path = install_user_hooks()
+    except (OSError, UnicodeError, ValueError) as error:
+        print("Vantage telemetry is configured, but its hooks could not be installed: %s" % error, file=sys.stderr)
+        return False
+    print("Installed Vantage hooks in %s." % path)
+    return True
 
 
 def remove_managed_block(text):
@@ -279,23 +460,13 @@ def verify_ingest_token(token):
 
 
 def write_config(path, lines):
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".config.toml.")
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as output:
-            output.write("\n".join(lines).rstrip("\n") + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    except BaseException:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-        raise
+    content = ("\n".join(lines).rstrip("\n") + "\n").encode("utf-8")
+    write_file(path, content)
 
 
 def print_next_steps():
     print("Next steps:")
-    print("1. Review and trust the Vantage hooks in /hooks or Settings > Hooks.")
+    print("1. Review and trust the Vantage hooks in Settings > Hooks.")
     print("2. Restart Codex.")
     print("3. Start a new conversation.")
 
@@ -321,9 +492,16 @@ def main():
         return 1
 
     if args.remove:
+        try:
+            removed_hooks = remove_user_hooks()
+        except (OSError, UnicodeError, ValueError) as error:
+            print("Could not remove Vantage hooks safely: %s" % error, file=sys.stderr)
+            return 5
         if not configured:
             if existing_vantage_token:
                 print("The Vantage configuration in %s is not managed by the plugin. No changes were made." % path)
+            elif removed_hooks:
+                print("Removed Vantage hooks from %s." % user_hooks_path())
             else:
                 print("Nothing to remove: no Vantage block in %s" % path)
             return 0
@@ -332,6 +510,8 @@ def main():
         return 0
 
     if configured:
+        if not install_user_hooks_or_report():
+            return 5
         print("Vantage telemetry is already configured in %s." % path)
         print_next_steps()
         return 0
@@ -362,6 +542,8 @@ def main():
         else:
             lines[otel_header + 1 : otel_header + 1] = block
         write_config(path, lines)
+        if not install_user_hooks_or_report():
+            return 5
         print("Refreshed Vantage telemetry in %s." % path)
         print_next_steps()
         return 0
@@ -390,6 +572,8 @@ def main():
     else:
         lines[otel_header + 1 : otel_header + 1] = block
     write_config(path, lines)
+    if not install_user_hooks_or_report():
+        return 5
     print("Configured Vantage telemetry in %s." % path)
     print_next_steps()
     return 0

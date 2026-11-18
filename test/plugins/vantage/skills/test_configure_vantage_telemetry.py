@@ -244,6 +244,72 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
         self.assertEqual(config, result)
         browser_sign_in.assert_not_called()
 
+    def test_installs_user_hooks_without_replacing_existing_hooks(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            hooks_path = pathlib.Path(codex_home) / "hooks.json"
+            existing = {
+                "hooks": {
+                    "PostToolUse": [{"hooks": [{"type": "command", "command": "echo existing"}]}],
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "echo start"}]}],
+                }
+            }
+            hooks_path.write_text(json.dumps(existing), encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                MODULE.install_user_hooks()
+                MODULE.install_user_hooks()
+                payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+                self.assertEqual(existing["hooks"]["PostToolUse"], payload["hooks"]["PostToolUse"])
+                self.assertEqual("echo start", payload["hooks"]["SessionStart"][0]["hooks"][0]["command"])
+                for event_name in ("SessionStart", "Stop"):
+                    managed = [
+                        handler
+                        for group in payload["hooks"][event_name]
+                        for handler in group.get("hooks", [])
+                        if MODULE.is_managed_hook(handler)
+                    ]
+                    self.assertEqual(1, len(managed))
+
+            installed = pathlib.Path(codex_home) / "vantage" / "hooks"
+            for name in MODULE.HOOK_SCRIPT_NAMES:
+                destination = installed / name
+                self.assertEqual(
+                    (MODULE.BUNDLED_HOOKS_DIR / name).read_bytes(),
+                    destination.read_bytes(),
+                )
+                self.assertTrue(destination.stat().st_mode & 0o100)
+
+    def test_remove_user_hooks_preserves_unrelated_hooks(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            hooks_path = pathlib.Path(codex_home) / "hooks.json"
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                MODULE.install_user_hooks()
+                payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+                payload["hooks"]["Stop"].insert(
+                    0,
+                    {"hooks": [{"type": "command", "command": "echo keep-me"}]},
+                )
+                hooks_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                self.assertTrue(MODULE.remove_user_hooks())
+
+            payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertEqual("echo keep-me", payload["hooks"]["Stop"][0]["hooks"][0]["command"])
+            self.assertNotIn("SessionStart", payload["hooks"])
+            for name in MODULE.HOOK_SCRIPT_NAMES:
+                self.assertFalse((pathlib.Path(codex_home) / "vantage" / "hooks" / name).exists())
+
+    def test_invalid_user_hooks_are_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            hooks_path = pathlib.Path(codex_home) / "hooks.json"
+            hooks_path.write_text("{invalid", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                with self.assertRaisesRegex(ValueError, "could not be read safely"):
+                    MODULE.install_user_hooks()
+
+            self.assertEqual("{invalid", hooks_path.read_text(encoding="utf-8"))
+            self.assertFalse((pathlib.Path(codex_home) / "vantage").exists())
 
 if __name__ == "__main__":
     unittest.main()

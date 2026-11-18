@@ -20,7 +20,7 @@ From the repository root:
 
 The installer replaces any existing local `vantage-codex-plugin` marketplace registration,
 installs `vantage@vantage-codex-plugin` from this checkout, and prints the active source.
-Start a new Codex session after installation so Codex reloads the plugin and its hooks.
+Start a new Codex session after installation so Codex reloads the plugin.
 
 After editing the plugin, run `./bin/install-local` again to refresh the installed copy.
 
@@ -47,3 +47,8 @@ Use the checkout-based installation above while actively developing the plugin.
 
 The Vantage API endpoints used by setup and ingestion remain in Vantage Core. This
 repository contains only code that is installed and executed on a Codex user's machine.
+
+Telemetry setup merges Vantage's `SessionStart` and `Stop` handlers into the user's
+`~/.codex/hooks.json`, copies their scripts to `~/.codex/vantage/hooks`, and preserves
+unrelated user hooks. Removing Vantage telemetry removes only those managed entries and
+copied scripts.
