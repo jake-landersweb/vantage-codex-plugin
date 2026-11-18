@@ -41,6 +41,7 @@ Use the checkout-based installation above while actively developing the plugin.
 - `.agents/plugins/marketplace.json` declares the local marketplace.
 - `plugins/vantage/plugin.json` declares the Vantage plugin.
 - `plugins/vantage/skills` contains telemetry setup and session attribution skills.
+- `plugins/vantage/server` contains the local MCP tools used to connect or remove telemetry.
 - `plugins/vantage/hooks` contains the local Codex hook and launcher.
 - `test/plugins/vantage` contains the standalone Python tests.
 

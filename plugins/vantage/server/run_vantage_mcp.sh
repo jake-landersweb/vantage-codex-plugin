@@ -6,15 +6,15 @@ if [ -z "$python_path" ]; then
 fi
 
 if [ -z "$python_path" ] || [ ! -x "$python_path" ]; then
-  echo "Vantage telemetry setup requires Python 3. Install Python 3, then run setup again." >&2
+  echo "Vantage telemetry setup requires Python 3. Install Python 3, then try again." >&2
   exit 4
 fi
 
 if [ "$python_path" = "/usr/bin/python3" ] && command -v xcode-select >/dev/null 2>&1; then
   if ! xcode-select -p >/dev/null 2>&1; then
-    echo "Vantage telemetry setup requires Python 3. Install Python 3, then run setup again." >&2
+    echo "Vantage telemetry setup requires Python 3. Install Python 3, then try again." >&2
     exit 4
   fi
 fi
 
-exec "$python_path" "$(dirname "$0")/configure_vantage_telemetry.py" "$@"
+exec "$python_path" "$(dirname "$0")/vantage_mcp.py"
