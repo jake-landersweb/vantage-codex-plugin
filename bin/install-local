@@ -3,8 +3,8 @@
 set -eu
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-marketplace_name=vantage-plugins
-plugin_selector=vantage@vantage-plugins
+marketplace_name=vantage-codex-plugin
+plugin_selector=vantage@vantage-codex-plugin
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "Codex CLI was not found on PATH." >&2

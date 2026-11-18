@@ -1,5 +1,5 @@
 {
-  "name": "vantage-plugins",
+  "name": "vantage-codex-plugin",
   "interface": {
     "displayName": "Vantage Plugins"
   },

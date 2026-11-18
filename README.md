@@ -18,8 +18,8 @@ From the repository root:
 ./bin/install-local
 ```
 
-The installer replaces any existing local `vantage-plugins` marketplace registration,
-installs `vantage@vantage-plugins` from this checkout, and prints the active source.
+The installer replaces any existing local `vantage-codex-plugin` marketplace registration,
+installs `vantage@vantage-codex-plugin` from this checkout, and prints the active source.
 Start a new Codex session after installation so Codex reloads the plugin and its hooks.
 
 After editing the plugin, run `./bin/install-local` again to refresh the installed copy.
@@ -30,8 +30,8 @@ Vantage developers with access to the private repository can install the publish
 marketplace directly:
 
 ```sh
-codex plugin marketplace add vantage-sh/vantage-plugins
-codex plugin add vantage@vantage-plugins
+codex plugin marketplace add vantage-sh/vantage-codex-plugin
+codex plugin add vantage@vantage-codex-plugin
 ```
 
 Use the checkout-based installation above while actively developing the plugin.
