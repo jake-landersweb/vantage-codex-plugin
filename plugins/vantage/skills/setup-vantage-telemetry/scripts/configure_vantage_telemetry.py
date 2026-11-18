@@ -21,7 +21,7 @@ BEGIN = "# BEGIN Vantage telemetry (managed by the Vantage plugin; rerun setup t
 END = "# END Vantage telemetry"
 INGEST_ENDPOINT = os.environ.get("VANTAGE_CODEX_INGEST_ENDPOINT", "https://ingest.vantage.sh/v1/logs")
 CLAIM_ENDPOINT = os.environ.get(
-    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.vantage.sh/internal/codex_telemetry_setup/claim"
+    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.vantage.sh/plugins/codex_telemetry_setup/claim"
 )
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
