@@ -48,7 +48,9 @@ OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
-HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "vantage_codex_hook.py")
+HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh",)
+LEGACY_HOOK_SCRIPT_NAMES = ("vantage_codex_hook.py",)
+CURRENT_PLUGIN_POINTER = "current"
 
 
 def codex_home_path():
@@ -68,10 +70,14 @@ def managed_hooks_dir():
     return codex_home_path() / "vantage" / "hooks"
 
 
+def current_plugin_pointer():
+    return managed_hooks_dir().parent / CURRENT_PLUGIN_POINTER
+
+
 def hook_handler(event_name):
     hooks_dir = managed_hooks_dir()
     shell_script = hooks_dir / "run_vantage_codex_hook.sh"
-    python_script = hooks_dir / "vantage_codex_hook.py"
+    python_script = current_plugin_pointer() / "vantage_codex_hook.py"
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
@@ -92,9 +98,12 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
+    legacy_python_script = managed_hooks_dir() / "vantage_codex_hook.py"
+    legacy_command_windows = subprocess.list2cmdline(["python", str(legacy_python_script)])
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows") == expected["commandWindows"]
+        or handler.get("commandWindows")
+        in (expected["commandWindows"], legacy_command_windows)
     )
 
 
@@ -158,9 +167,22 @@ def write_user_hooks(payload):
 
 def copy_managed_hook_scripts():
     destination = managed_hooks_dir()
-    for name in HOOK_SCRIPT_NAMES:
-        source = BUNDLED_HOOKS_DIR / name
-        write_file(destination / name, source.read_bytes(), mode=0o700)
+    source = BUNDLED_HOOKS_DIR / HOOK_SCRIPT_NAMES[0]
+    write_file(destination / source.name, source.read_bytes(), mode=0o700)
+    for name in LEGACY_HOOK_SCRIPT_NAMES:
+        (destination / name).unlink(missing_ok=True)
+
+    pointer = current_plugin_pointer()
+    if os.path.lexists(pointer) and not pointer.is_symlink():
+        raise OSError("Vantage plugin pointer is not a symbolic link: %s" % pointer)
+
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix=".current-", dir=str(pointer.parent)))
+    temporary_pointer = temporary / CURRENT_PLUGIN_POINTER
+    try:
+        temporary_pointer.symlink_to(BUNDLED_HOOKS_DIR, target_is_directory=True)
+        os.replace(temporary_pointer, pointer)
+    finally:
+        temporary.rmdir()
 
 
 def install_user_hooks():
@@ -180,13 +202,19 @@ def install_user_hooks():
 def remove_managed_hook_scripts():
     changed = False
     directory = managed_hooks_dir()
-    for name in HOOK_SCRIPT_NAMES:
+    for name in (*HOOK_SCRIPT_NAMES, *LEGACY_HOOK_SCRIPT_NAMES):
         path = directory / name
         try:
             path.unlink()
             changed = True
         except FileNotFoundError:
             pass
+    pointer = current_plugin_pointer()
+    if pointer.is_symlink():
+        pointer.unlink()
+        changed = True
+    elif pointer.exists():
+        raise OSError("Vantage plugin pointer is not a symbolic link: %s" % pointer)
     for path in (directory, directory.parent):
         try:
             path.rmdir()

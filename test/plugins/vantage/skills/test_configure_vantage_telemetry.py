@@ -258,7 +258,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
                 MODULE.install_user_hooks()
                 installed = pathlib.Path(codex_home) / "vantage" / "hooks"
-                for name in MODULE.HOOK_SCRIPT_NAMES:
+                for name in (*MODULE.HOOK_SCRIPT_NAMES, *MODULE.LEGACY_HOOK_SCRIPT_NAMES):
                     (installed / name).write_bytes(b"stale hook script")
                 MODULE.install_user_hooks()
                 payload = json.loads(hooks_path.read_text(encoding="utf-8"))
@@ -272,6 +272,14 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                         if MODULE.is_managed_hook(handler)
                     ]
                     self.assertEqual(1, len(managed))
+                self.assertIn(
+                    MODULE.CURRENT_PLUGIN_POINTER,
+                    json.dumps(payload["hooks"]),
+                )
+                self.assertNotIn(
+                    "vantage/hooks/vantage_codex_hook.py",
+                    json.dumps(payload["hooks"]),
+                )
 
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 destination = installed / name
@@ -280,6 +288,10 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     destination.read_bytes(),
                 )
                 self.assertTrue(destination.stat().st_mode & 0o100)
+            pointer = installed.parent / MODULE.CURRENT_PLUGIN_POINTER
+            self.assertTrue(pointer.is_symlink())
+            self.assertEqual(MODULE.BUNDLED_HOOKS_DIR, pointer.resolve())
+            self.assertFalse((installed / "vantage_codex_hook.py").exists())
 
     def test_remove_user_hooks_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as codex_home:
@@ -300,6 +312,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             self.assertNotIn("SessionStart", payload["hooks"])
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 self.assertFalse((pathlib.Path(codex_home) / "vantage" / "hooks" / name).exists())
+            self.assertFalse(
+                (pathlib.Path(codex_home) / "vantage" / MODULE.CURRENT_PLUGIN_POINTER).exists()
+            )
 
     def test_remove_reports_removed_hooks_when_configuration_is_unmanaged(self):
         config = """[otel]

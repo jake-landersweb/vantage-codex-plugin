@@ -49,7 +49,10 @@ The Vantage API endpoints used by setup and ingestion remain in Vantage Core. Th
 repository contains only code that is installed and executed on a Codex user's machine.
 
 Telemetry setup merges Vantage's `SessionStart` and `Stop` handlers into the user's
-`~/.codex/hooks.json`, copies their scripts to `~/.codex/vantage/hooks`, and preserves
-unrelated user hooks. Removing Vantage telemetry removes only those managed entries and
-copied scripts. Workspace users should rerun Vantage telemetry setup after every plugin
-update so the copied hook scripts are refreshed from the newly installed plugin version.
+`~/.codex/hooks.json`, installs a stable launcher in `~/.codex/vantage/hooks`, and
+maintains `~/.codex/vantage/current` as a pointer to the active plugin hook directory.
+The Python hook remains owned by the plugin instead of being copied into the user's
+hooks directory. If the pointer becomes stale after a versioned cache update, the
+launcher selects the newest installed Vantage plugin hook directory at runtime.
+Unrelated user hooks, telemetry configuration, and credentials are preserved. Removing
+Vantage telemetry removes only the managed entries, launcher, and pointer.
