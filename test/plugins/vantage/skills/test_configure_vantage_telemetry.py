@@ -59,8 +59,9 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
     def test_browser_sign_in_uses_no_localhost_callback(self):
         with mock.patch.object(MODULE.time, "time", return_value=1_000):
-            with mock.patch.object(MODULE.webbrowser, "open", return_value=True) as browser_open:
-                verifier, authorization_expires_at = MODULE.browser_sign_in()
+            with mock.patch.object(MODULE.sys, "platform", "linux"):
+                with mock.patch.object(MODULE.webbrowser, "open", return_value=True) as browser_open:
+                    verifier, authorization_expires_at = MODULE.browser_sign_in()
 
         authorization_url = browser_open.call_args.args[0]
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(authorization_url).query)
@@ -74,6 +75,31 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         self.assertEqual(1_000 + MODULE.AUTHORIZATION_TIMEOUT, authorization_expires_at)
         self.assertNotIn("redirect_uri", query)
         self.assertNotIn("state", query)
+
+    def test_browser_sign_in_uses_native_open_on_macos(self):
+        completed = mock.Mock(returncode=0)
+
+        with mock.patch.object(MODULE.sys, "platform", "darwin"):
+            with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+                with mock.patch.object(MODULE.webbrowser, "open") as browser_open:
+                    MODULE.browser_sign_in()
+
+        command = run.call_args.args[0]
+        self.assertEqual("open", command[0])
+        self.assertTrue(command[1].startswith(MODULE.AUTHORIZATION_ENDPOINT + "?"))
+        self.assertEqual(MODULE.subprocess.DEVNULL, run.call_args.kwargs["stdout"])
+        self.assertEqual(MODULE.subprocess.DEVNULL, run.call_args.kwargs["stderr"])
+        browser_open.assert_not_called()
+
+    def test_browser_sign_in_does_not_print_the_authorization_url(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(MODULE, "open_authorization_url", return_value=False):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaisesRegex(ValueError, "could not be opened"):
+                    MODULE.browser_sign_in()
+
+        self.assertEqual("", stdout.getvalue())
 
     def test_waits_until_vantage_returns_the_ingest_token(self):
         responses = [
