@@ -1,7 +1,5 @@
 #!/bin/sh
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
 python_path="${VANTAGE_CODEX_PYTHON:-}"
 if [ -z "$python_path" ]; then
   python_path="$(command -v python3 2>/dev/null || true)"
@@ -17,4 +15,7 @@ if [ "$python_path" = "/usr/bin/python3" ] && command -v xcode-select >/dev/null
   fi
 fi
 
-exec "$python_path" "${script_dir}/vantage_codex_hook.py"
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+launcher="${script_dir}/run_vantage_codex_hook.py"
+[ -f "$launcher" ] || exit 0
+exec "$python_path" -I "$launcher"

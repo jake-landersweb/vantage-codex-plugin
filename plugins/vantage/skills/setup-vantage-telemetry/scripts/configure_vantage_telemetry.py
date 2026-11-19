@@ -48,7 +48,7 @@ OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
-HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "vantage_codex_hook.py")
+HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 
 
 def codex_home_path():
@@ -71,11 +71,11 @@ def managed_hooks_dir():
 def hook_handler(event_name):
     hooks_dir = managed_hooks_dir()
     shell_script = hooks_dir / "run_vantage_codex_hook.sh"
-    python_script = hooks_dir / "vantage_codex_hook.py"
+    python_script = hooks_dir / "run_vantage_codex_hook.py"
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["python", str(python_script)]),
+        "commandWindows": subprocess.list2cmdline(["python", "-I", str(python_script)]),
         "timeout": 30,
         "statusMessage": (
             "Loading Vantage attribution"

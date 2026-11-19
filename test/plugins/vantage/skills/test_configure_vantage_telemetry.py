@@ -272,6 +272,15 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                         if MODULE.is_managed_hook(handler)
                     ]
                     self.assertEqual(1, len(managed))
+                self.assertIn(
+                    "run_vantage_codex_hook.py",
+                    json.dumps(payload["hooks"]),
+                )
+                self.assertIn("-I", json.dumps(payload["hooks"]))
+                self.assertNotIn(
+                    "vantage/hooks/vantage_codex_hook.py",
+                    json.dumps(payload["hooks"]),
+                )
 
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 destination = installed / name
