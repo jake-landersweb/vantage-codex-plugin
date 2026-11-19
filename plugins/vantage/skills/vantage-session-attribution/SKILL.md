@@ -1,16 +1,12 @@
 ---
 name: vantage-session-attribution
-description: Tag the current Codex task with purpose and project when the Vantage hook supplies a session-specific attribution command.
+description: Apply the current Vantage classifier when the Vantage hook supplies a classifier file and session-specific attribution command.
 ---
 
-Use the exact session-specific attribution command supplied by the Vantage hook for the current Codex session.
+Read the classifier Markdown file supplied by the Vantage hook in full. Treat it as the source of truth for classification instructions and allowed values.
 
-Add:
+Use the exact session-specific attribution command supplied by the hook. Append only flags directed by the classifier. Do not infer allowed values or classification rules from this skill.
 
-- `--purpose research`, `development`, `design`, or `unclassified`
-- `--project` only when the project is explicit; do not infer it from a team or repository
-- `--source explicit`, `inferred`, or `manual`
-
-Tag the session at the beginning of substantive work and whenever its purpose or project changes. Do not resend unchanged metadata every turn.
+Apply the classifier at the beginning of substantive work and whenever the classification changes. Do not resend unchanged metadata every turn.
 
 Do not send prompts, summaries, source code, tool output, credentials, personal data, or local file paths. If the hook did not supply an attribution command, do nothing. Usage reporting continues independently.

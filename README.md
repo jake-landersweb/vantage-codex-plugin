@@ -54,4 +54,12 @@ On every run, the launcher reads each installed Vantage plugin's declared `versi
 from `plugin.json` and executes the newest plugin-owned Python hook in the same isolated
 Python process. If no valid hook is installed, it exits successfully without doing
 anything. Unrelated user hooks, telemetry configuration, and credentials are preserved.
-Removing Vantage telemetry removes only the managed entries and launcher.
+Setup also stores a read-only classifier credential and the current classifier Markdown
+under `~/.codex/vantage` with user-only permissions. At each `SessionStart`, the hook
+uses an ETag conditional request to refresh the Markdown and falls back to the last
+valid copy when Vantage is unavailable. The attribution skill reads that file instead
+of embedding classifier values. Vantage scopes the Markdown to the customer's account,
+so its real-time AI sources share one classifier. Classifiers may define custom tag
+dimensions; hooks send them under the `vantage.classification.*` namespace without
+interpreting their meaning. Removing Vantage telemetry removes
+the managed hooks, launcher, classifier credential, and cached classifier.
