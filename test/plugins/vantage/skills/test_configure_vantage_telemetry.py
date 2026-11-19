@@ -258,7 +258,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
                 MODULE.install_user_hooks()
                 installed = pathlib.Path(codex_home) / "vantage" / "hooks"
-                for name in (*MODULE.HOOK_SCRIPT_NAMES, *MODULE.LEGACY_HOOK_SCRIPT_NAMES):
+                for name in MODULE.HOOK_SCRIPT_NAMES:
                     (installed / name).write_bytes(b"stale hook script")
                 MODULE.install_user_hooks()
                 payload = json.loads(hooks_path.read_text(encoding="utf-8"))
@@ -291,7 +291,6 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             pointer = installed.parent / MODULE.CURRENT_PLUGIN_POINTER
             self.assertTrue(pointer.is_symlink())
             self.assertEqual(MODULE.BUNDLED_HOOKS_DIR, pointer.resolve())
-            self.assertFalse((installed / "vantage_codex_hook.py").exists())
 
     def test_remove_user_hooks_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as codex_home:

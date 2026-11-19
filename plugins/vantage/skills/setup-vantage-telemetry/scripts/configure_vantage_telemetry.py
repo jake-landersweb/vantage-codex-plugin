@@ -49,7 +49,6 @@ TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh",)
-LEGACY_HOOK_SCRIPT_NAMES = ("vantage_codex_hook.py",)
 CURRENT_PLUGIN_POINTER = "current"
 
 
@@ -98,12 +97,9 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
-    legacy_python_script = managed_hooks_dir() / "vantage_codex_hook.py"
-    legacy_command_windows = subprocess.list2cmdline(["python", str(legacy_python_script)])
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows")
-        in (expected["commandWindows"], legacy_command_windows)
+        or handler.get("commandWindows") == expected["commandWindows"]
     )
 
 
@@ -169,8 +165,6 @@ def copy_managed_hook_scripts():
     destination = managed_hooks_dir()
     source = BUNDLED_HOOKS_DIR / HOOK_SCRIPT_NAMES[0]
     write_file(destination / source.name, source.read_bytes(), mode=0o700)
-    for name in LEGACY_HOOK_SCRIPT_NAMES:
-        (destination / name).unlink(missing_ok=True)
 
     pointer = current_plugin_pointer()
     if os.path.lexists(pointer) and not pointer.is_symlink():
@@ -202,7 +196,7 @@ def install_user_hooks():
 def remove_managed_hook_scripts():
     changed = False
     directory = managed_hooks_dir()
-    for name in (*HOOK_SCRIPT_NAMES, *LEGACY_HOOK_SCRIPT_NAMES):
+    for name in HOOK_SCRIPT_NAMES:
         path = directory / name
         try:
             path.unlink()
