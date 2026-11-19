@@ -273,9 +273,10 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     ]
                     self.assertEqual(1, len(managed))
                 self.assertIn(
-                    MODULE.CURRENT_PLUGIN_POINTER,
+                    "run_vantage_codex_hook.py",
                     json.dumps(payload["hooks"]),
                 )
+                self.assertIn("-I", json.dumps(payload["hooks"]))
                 self.assertNotIn(
                     "vantage/hooks/vantage_codex_hook.py",
                     json.dumps(payload["hooks"]),
@@ -288,9 +289,6 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     destination.read_bytes(),
                 )
                 self.assertTrue(destination.stat().st_mode & 0o100)
-            pointer = installed.parent / MODULE.CURRENT_PLUGIN_POINTER
-            self.assertTrue(pointer.is_symlink())
-            self.assertEqual(MODULE.BUNDLED_HOOKS_DIR, pointer.resolve())
 
     def test_remove_user_hooks_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as codex_home:
@@ -311,9 +309,6 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             self.assertNotIn("SessionStart", payload["hooks"])
             for name in MODULE.HOOK_SCRIPT_NAMES:
                 self.assertFalse((pathlib.Path(codex_home) / "vantage" / "hooks" / name).exists())
-            self.assertFalse(
-                (pathlib.Path(codex_home) / "vantage" / MODULE.CURRENT_PLUGIN_POINTER).exists()
-            )
 
     def test_remove_reports_removed_hooks_when_configuration_is_unmanaged(self):
         config = """[otel]

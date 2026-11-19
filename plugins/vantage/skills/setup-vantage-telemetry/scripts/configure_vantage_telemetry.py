@@ -48,8 +48,7 @@ OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
-HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh",)
-CURRENT_PLUGIN_POINTER = "current"
+HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 
 
 def codex_home_path():
@@ -69,18 +68,14 @@ def managed_hooks_dir():
     return codex_home_path() / "vantage" / "hooks"
 
 
-def current_plugin_pointer():
-    return managed_hooks_dir().parent / CURRENT_PLUGIN_POINTER
-
-
 def hook_handler(event_name):
     hooks_dir = managed_hooks_dir()
     shell_script = hooks_dir / "run_vantage_codex_hook.sh"
-    python_script = current_plugin_pointer() / "vantage_codex_hook.py"
+    python_script = hooks_dir / "run_vantage_codex_hook.py"
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["python", str(python_script)]),
+        "commandWindows": subprocess.list2cmdline(["python", "-I", str(python_script)]),
         "timeout": 30,
         "statusMessage": (
             "Loading Vantage attribution"
@@ -163,20 +158,9 @@ def write_user_hooks(payload):
 
 def copy_managed_hook_scripts():
     destination = managed_hooks_dir()
-    source = BUNDLED_HOOKS_DIR / HOOK_SCRIPT_NAMES[0]
-    write_file(destination / source.name, source.read_bytes(), mode=0o700)
-
-    pointer = current_plugin_pointer()
-    if os.path.lexists(pointer) and not pointer.is_symlink():
-        raise OSError("Vantage plugin pointer is not a symbolic link: %s" % pointer)
-
-    temporary = pathlib.Path(tempfile.mkdtemp(prefix=".current-", dir=str(pointer.parent)))
-    temporary_pointer = temporary / CURRENT_PLUGIN_POINTER
-    try:
-        temporary_pointer.symlink_to(BUNDLED_HOOKS_DIR, target_is_directory=True)
-        os.replace(temporary_pointer, pointer)
-    finally:
-        temporary.rmdir()
+    for name in HOOK_SCRIPT_NAMES:
+        source = BUNDLED_HOOKS_DIR / name
+        write_file(destination / name, source.read_bytes(), mode=0o700)
 
 
 def install_user_hooks():
@@ -203,12 +187,6 @@ def remove_managed_hook_scripts():
             changed = True
         except FileNotFoundError:
             pass
-    pointer = current_plugin_pointer()
-    if pointer.is_symlink():
-        pointer.unlink()
-        changed = True
-    elif pointer.exists():
-        raise OSError("Vantage plugin pointer is not a symbolic link: %s" % pointer)
     for path in (directory, directory.parent):
         try:
             path.rmdir()

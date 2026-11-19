@@ -287,11 +287,16 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         self.assertEqual("", result.stdout)
         self.assertEqual("", result.stderr)
 
-    def test_launcher_resolves_the_hook_without_plugin_root(self):
+    def test_launcher_resolves_an_explicit_plugin_root(self):
         launcher = SCRIPT.parent / "run_vantage_codex_hook.sh"
         environment = os.environ.copy()
         environment.pop("PLUGIN_ROOT", None)
-        environment["VANTAGE_CODEX_PYTHON"] = sys.executable
+        environment.update(
+            {
+                "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage"),
+                "VANTAGE_CODEX_PYTHON": sys.executable,
+            }
+        )
 
         result = subprocess.run(
             ["sh", str(launcher)],
@@ -306,23 +311,27 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         self.assertIn("tag --session session-1", result.stdout)
         self.assertEqual("", result.stderr)
 
-    def test_launcher_uses_the_newest_cached_plugin_when_pointer_is_stale(self):
+    def test_launcher_uses_the_newest_declared_plugin_version(self):
         codex_home = self.directory / "codex"
         cache_root = codex_home / "plugins" / "cache" / "workspace-directory" / "vantage"
-        old_hooks = cache_root / "0.3.1" / "hooks"
-        new_hooks = cache_root / "0.3.2" / "hooks"
+        old_plugin = cache_root / "999-not-a-version"
+        new_plugin = cache_root / "carton-at-the-back"
+        old_hooks = old_plugin / "hooks"
+        new_hooks = new_plugin / "hooks"
         old_hooks.mkdir(parents=True)
         new_hooks.mkdir(parents=True)
+        (old_plugin / "plugin.json").write_text(
+            json.dumps({"name": "vantage", "version": "0.3.1"}), encoding="utf-8"
+        )
+        (new_plugin / "plugin.json").write_text(
+            json.dumps({"name": "vantage", "version": "0.4.0"}), encoding="utf-8"
+        )
         (old_hooks / "vantage_codex_hook.py").write_text(
             "print('old hook')\n", encoding="utf-8"
         )
         (new_hooks / "vantage_codex_hook.py").write_text(
             "print('new hook')\n", encoding="utf-8"
         )
-        installed_hooks = codex_home / "vantage" / "hooks"
-        installed_hooks.mkdir(parents=True)
-        current = installed_hooks.parent / "current"
-        current.symlink_to(codex_home / "missing-plugin", target_is_directory=True)
 
         environment = os.environ.copy()
         environment.update(
@@ -342,6 +351,73 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
 
         self.assertEqual(0, result.returncode)
         self.assertEqual("new hook\n", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_launcher_does_nothing_when_no_valid_hook_is_installed(self):
+        codex_home = self.directory / "codex"
+        invalid_plugin = (
+            codex_home
+            / "plugins"
+            / "cache"
+            / "workspace-directory"
+            / "vantage"
+            / "newest-looking-folder"
+        )
+        (invalid_plugin / "hooks").mkdir(parents=True)
+        (invalid_plugin / "plugin.json").write_text(
+            json.dumps({"name": "vantage", "version": "not-a-version"}),
+            encoding="utf-8",
+        )
+        (invalid_plugin / "hooks" / "vantage_codex_hook.py").write_text(
+            "print('should not run')\n", encoding="utf-8"
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CODEX_HOME": str(codex_home),
+                "VANTAGE_CODEX_PYTHON": sys.executable,
+            }
+        )
+        result = subprocess.run(
+            ["sh", str(SCRIPT.parent / "run_vantage_codex_hook.sh")],
+            input=json.dumps({"hook_event_name": "SessionStart", "session_id": "session-1"}),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_launcher_ignores_pythonpath_modules(self):
+        injected_modules = self.directory / "injected-modules"
+        injected_modules.mkdir()
+        (injected_modules / "re.py").write_text(
+            "raise RuntimeError('loaded injected re.py')\n", encoding="utf-8"
+        )
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PYTHONPATH": str(injected_modules),
+                "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage"),
+                "VANTAGE_CODEX_PYTHON": sys.executable,
+            }
+        )
+        result = subprocess.run(
+            ["sh", str(SCRIPT.parent / "run_vantage_codex_hook.sh")],
+            input=json.dumps({"hook_event_name": "SessionStart", "session_id": "session-1"}),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode)
+        self.assertIn("tag --session session-1", result.stdout)
         self.assertEqual("", result.stderr)
 
 
