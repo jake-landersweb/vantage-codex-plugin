@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1"
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 EVENT_NAME = "codex.turn.attribution"
 PURPOSES = ("research", "development", "design", "unclassified")

@@ -324,7 +324,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
             json.dumps({"name": "vantage", "version": "0.3.1"}), encoding="utf-8"
         )
         (new_plugin / "plugin.json").write_text(
-            json.dumps({"name": "vantage", "version": "0.4.0"}), encoding="utf-8"
+            json.dumps({"name": "vantage", "version": "0.3.2"}), encoding="utf-8"
         )
         (old_hooks / "vantage_codex_hook.py").write_text(
             "print('old hook')\n", encoding="utf-8"
