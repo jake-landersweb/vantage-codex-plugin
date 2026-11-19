@@ -1,3 +1,3 @@
 interface:
   display_name: "Attribute Vantage session"
-  short_description: "Tag Codex purpose and project"
+  short_description: "Apply the current Vantage classifier"

@@ -29,6 +29,17 @@ class VantageCodexHookTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def install_cached_classifier(self, codex_home, token=False):
+        vantage = Path(codex_home) / "vantage"
+        vantage.mkdir(parents=True, exist_ok=True)
+        (vantage / "classifier.md").write_text(
+            "# Test classifier\n", encoding="utf-8"
+        )
+        if token:
+            (vantage / "classifier_read_token").write_text(
+                "classifier-token", encoding="utf-8"
+            )
+
     def test_prefers_plugin_managed_credential_over_environment_variable(self):
         codex_home = self.directory / "codex"
         codex_home.mkdir()
@@ -41,6 +52,7 @@ exporter = { otlp-http = { headers = { authorization = "Bearer vntg_ti_TEST_CRED
 """.lstrip(),
             encoding="utf-8",
         )
+        self.install_cached_classifier(codex_home)
         output = io.StringIO()
         env = {
             "CODEX_HOME": str(codex_home),
@@ -137,6 +149,8 @@ exporter = {{ otlp-http = {{ endpoint = "{HOOK.INGEST_ENDPOINT}", headers = {{ a
 
     def test_session_start_does_not_read_the_telemetry_config(self):
         output = io.StringIO()
+        codex_home = self.directory / "codex"
+        self.install_cached_classifier(codex_home)
 
         with mock.patch.object(HOOK, "ingest_token") as ingest_token:
             HOOK.run(
@@ -145,13 +159,103 @@ exporter = {{ otlp-http = {{ endpoint = "{HOOK.INGEST_ENDPOINT}", headers = {{ a
                         {"hook_event_name": "SessionStart", "session_id": "session-1"}
                     )
                 ),
-                env={},
+                env={"CODEX_HOME": str(codex_home)},
                 stdout=output,
                 stderr=io.StringIO(),
             )
 
         ingest_token.assert_not_called()
         self.assertIn("tag --session session-1", output.getvalue())
+        self.assertIn("classifier.md", output.getvalue())
+
+    def test_refreshes_classifier_with_etag_and_private_permissions(self):
+        codex_home = self.directory / "codex"
+        self.install_cached_classifier(codex_home, token=True)
+        (codex_home / "vantage" / "classifier.etag").write_text(
+            '"old"', encoding="utf-8"
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {"classifier_markdown": "# Updated classifier\n"}
+        ).encode("utf-8")
+        response.headers = {"ETag": '"new"'}
+        opener = mock.Mock()
+        opener.open.return_value = response
+        env = {
+            "CODEX_HOME": str(codex_home),
+            "VANTAGE_CLASSIFIER_ENDPOINT": "https://api.vantage.sh/plugins/realtime_ai_classifier",
+        }
+
+        with mock.patch.object(HOOK.urllib.request, "build_opener", return_value=opener):
+            self.assertTrue(HOOK.refresh_classifier(env, stderr=io.StringIO()))
+
+        request = opener.open.call_args.args[0]
+        self.assertEqual(
+            HOOK.CLASSIFIER_TIMEOUT,
+            opener.open.call_args.kwargs["timeout"],
+        )
+        self.assertEqual("Bearer classifier-token", request.get_header("Authorization"))
+        self.assertEqual('"old"', request.get_header("If-none-match"))
+        classifier = codex_home / "vantage" / "classifier.md"
+        self.assertEqual("# Updated classifier\n", classifier.read_text(encoding="utf-8"))
+        self.assertEqual(0o600, classifier.stat().st_mode & 0o777)
+        self.assertEqual(
+            '"new"',
+            (codex_home / "vantage" / "classifier.etag").read_text(encoding="utf-8"),
+        )
+
+    def test_classifier_values_are_not_hardcoded_in_the_hook(self):
+        status = HOOK.tag(
+            [
+                "--session",
+                "session-1",
+                "--tag",
+                "work_type=bug_fix",
+                "--tag",
+                "department=engineering",
+            ],
+            env={"VANTAGE_CODEX_HOOK_STATE_DIR": str(self.state_directory)},
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+
+        self.assertEqual(0, status)
+
+    def test_reclassification_replaces_omitted_custom_tags(self):
+        env = {"VANTAGE_CODEX_HOOK_STATE_DIR": str(self.state_directory)}
+        self.assertEqual(
+            0,
+            HOOK.tag(
+                ["--session", "session-1", "--tag", "department=engineering"],
+                env=env,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            ),
+        )
+        self.assertEqual(
+            0,
+            HOOK.tag(
+                ["--session", "session-1", "--tag", "work_type=research"],
+                env=env,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            ),
+        )
+
+        self.assertEqual({"work_type": "research"}, HOOK.skill_tags(env, "session-1"))
+
+    def test_rejects_invalid_custom_tags(self):
+        env = {"VANTAGE_CODEX_HOOK_STATE_DIR": str(self.state_directory)}
+        for value in ("missing-equals", "Department=engineering", "department=line\nbreak"):
+            status = HOOK.tag(
+                ["--session", "session-1", "--tag", value],
+                env=env,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+
+            self.assertEqual(1, status)
 
     def test_does_not_reuse_credential_from_another_exporter(self):
         codex_home = self.directory / "codex"
@@ -197,12 +301,14 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
             [
                 "--session",
                 "session-1",
-                "--purpose",
-                "development",
-                "--project",
-                "Codex",
-                "--source",
-                "explicit",
+                "--tag",
+                "purpose=development",
+                "--tag",
+                "project=Codex",
+                "--tag",
+                "source=explicit",
+                "--tag",
+                "department=engineering",
             ],
             env=env,
             stdout=io.StringIO(),
@@ -240,8 +346,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         self.assertEqual("codex.turn.attribution", record["eventName"])
         self.assertEqual("session-1", attributes["conversation.id"])
         self.assertEqual("turn-1", attributes["codex.turn.id"])
-        self.assertEqual("development", attributes["vantage.purpose"])
-        self.assertEqual("Codex", attributes["vantage.project"])
+        self.assertEqual("development", attributes["vantage.classification.purpose"])
+        self.assertEqual("Codex", attributes["vantage.classification.project"])
+        self.assertEqual("engineering", attributes["vantage.classification.department"])
         self.assertNotIn("vantage.github", attributes)
         self.assertNotIn("vantage.ticket", attributes)
         serialized = json.dumps(body)
@@ -291,8 +398,11 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         launcher = SCRIPT.parent / "run_vantage_codex_hook.sh"
         environment = os.environ.copy()
         environment.pop("PLUGIN_ROOT", None)
+        codex_home = self.directory / "codex"
+        self.install_cached_classifier(codex_home)
         environment.update(
             {
+                "CODEX_HOME": str(codex_home),
                 "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage"),
                 "VANTAGE_CODEX_PYTHON": sys.executable,
             }
@@ -334,6 +444,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         )
 
         environment = os.environ.copy()
+        self.install_cached_classifier(codex_home)
         environment.update(
             {
                 "CODEX_HOME": str(codex_home),
@@ -400,8 +511,11 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         )
 
         environment = os.environ.copy()
+        codex_home = self.directory / "codex"
+        self.install_cached_classifier(codex_home)
         environment.update(
             {
+                "CODEX_HOME": str(codex_home),
                 "PYTHONPATH": str(injected_modules),
                 "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage"),
                 "VANTAGE_CODEX_PYTHON": sys.executable,

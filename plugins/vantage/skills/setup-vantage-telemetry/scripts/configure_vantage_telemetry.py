@@ -29,12 +29,13 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.4.0"
 USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
 REQUEST_TIMEOUT = max(1, min(300, float(os.environ.get("VANTAGE_CODEX_REQUEST_TIMEOUT", "15"))))
+MAX_CLASSIFIER_BYTES = 64 * 1024
 MANAGED_KEYS = (
     "exporter",
     "log_user_prompt",
@@ -66,6 +67,22 @@ def user_hooks_path():
 
 def managed_hooks_dir():
     return codex_home_path() / "vantage" / "hooks"
+
+
+def classifier_directory():
+    return codex_home_path() / "vantage"
+
+
+def classifier_token_path():
+    return classifier_directory() / "classifier_read_token"
+
+
+def classifier_markdown_path():
+    return classifier_directory() / "classifier.md"
+
+
+def classifier_etag_path():
+    return classifier_directory() / "classifier.etag"
 
 
 def hook_handler(event_name):
@@ -154,6 +171,43 @@ def write_file(path, content, mode=0o600):
 def write_user_hooks(payload):
     content = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
     write_file(user_hooks_path(), content)
+
+
+def classifier_bundle(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Vantage did not return classifier configuration.")
+
+    token = payload.get("classifier_read_token")
+    markdown = payload.get("classifier_markdown")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("Vantage did not return a classifier credential.")
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise ValueError("Vantage did not return a classifier.")
+    encoded = markdown.encode("utf-8")
+    if len(encoded) > MAX_CLASSIFIER_BYTES:
+        raise ValueError("The Vantage classifier is too large.")
+    return {"token": token.strip(), "markdown": encoded}
+
+
+def save_classifier(bundle):
+    write_file(classifier_token_path(), bundle["token"].encode("utf-8"))
+    write_file(classifier_markdown_path(), bundle["markdown"])
+    classifier_etag_path().unlink(missing_ok=True)
+
+
+def remove_classifier_files():
+    changed = False
+    for path in (classifier_token_path(), classifier_markdown_path(), classifier_etag_path()):
+        try:
+            path.unlink()
+            changed = True
+        except FileNotFoundError:
+            pass
+    try:
+        classifier_directory().rmdir()
+    except OSError:
+        pass
+    return changed
 
 
 def copy_managed_hook_scripts():
@@ -373,7 +427,7 @@ def browser_sign_in():
     return code_verifier, authorization_expires_at
 
 
-def wait_for_ingest_token(code_verifier, authorization_expires_at):
+def wait_for_setup_credentials(code_verifier, authorization_expires_at):
     remaining = authorization_expires_at - time.time()
     if remaining <= 0:
         raise ValueError("Vantage sign-in timed out. Start setup again.")
@@ -409,9 +463,9 @@ def wait_for_ingest_token(code_verifier, authorization_expires_at):
                     poll_interval = min(MAX_POLL_INTERVAL, poll_interval * 2)
                     continue
         except urllib.error.HTTPError as error:
-            if error.code == 429:
+            if error.code in (429, 503):
                 if time.monotonic() >= deadline:
-                    raise ValueError("Vantage setup was rate limited. Wait a minute and start setup again.") from error
+                    raise ValueError("Vantage could not finish setup. Start setup again.") from error
                 time.sleep(poll_interval)
                 poll_interval = min(MAX_POLL_INTERVAL, poll_interval * 2)
                 continue
@@ -428,7 +482,7 @@ def wait_for_ingest_token(code_verifier, authorization_expires_at):
         token = payload.get("plaintext_token") if isinstance(payload, dict) else None
         if not isinstance(token, str) or not token.strip():
             raise ValueError("Vantage did not return an ingest credential.")
-        return token.strip()
+        return {"ingest_token": token.strip(), "classifier": classifier_bundle(payload)}
 
 
 def verify_ingest_token(token):
@@ -494,21 +548,22 @@ def main():
     if args.remove:
         try:
             removed_hooks = remove_user_hooks()
+            removed_classifier = remove_classifier_files()
         except (OSError, UnicodeError, ValueError) as error:
-            print("Could not remove Vantage hooks safely: %s" % error, file=sys.stderr)
+            print("Could not remove Vantage files safely: %s" % error, file=sys.stderr)
             return 5
         if not configured:
             if existing_vantage_token:
-                if removed_hooks:
-                    print("Removed Vantage hooks from %s." % user_hooks_path())
+                if removed_hooks or removed_classifier:
+                    print("Removed Vantage hooks and classifier files.")
                     print(
                         "The Vantage configuration in %s is not managed by the plugin, so its telemetry settings were left unchanged."
                         % path
                     )
                 else:
                     print("The Vantage configuration in %s is not managed by the plugin. No changes were made." % path)
-            elif removed_hooks:
-                print("Removed Vantage hooks from %s." % user_hooks_path())
+            elif removed_hooks or removed_classifier:
+                print("Removed Vantage hooks and classifier files.")
             else:
                 print("Nothing to remove: no Vantage block in %s" % path)
             return 0
@@ -517,6 +572,12 @@ def main():
         return 0
 
     if configured:
+        if not classifier_token_path().is_file() or not classifier_markdown_path().is_file():
+            print(
+                "Vantage telemetry is configured, but its classifier files are missing. Remove Vantage telemetry and connect again.",
+                file=sys.stderr,
+            )
+            return 2
         if not install_user_hooks_or_report():
             return 5
         print("Vantage telemetry is already configured in %s." % path)
@@ -527,7 +588,7 @@ def main():
         lines = remove_managed_settings(lines)
         try:
             otel_header, has_environment, remaining_conflicts = inspect_otel(lines)
-        except ValueError as error:
+        except (OSError, UnicodeError, ValueError) as error:
             print("Could not safely normalize %s: %s" % (path, error), file=sys.stderr)
             return 3
         if remaining_conflicts or has_vantage_endpoint(lines):
@@ -538,9 +599,11 @@ def main():
             return 3
         try:
             code_verifier, authorization_expires_at = browser_sign_in()
-            token = wait_for_ingest_token(code_verifier, authorization_expires_at)
+            credentials = wait_for_setup_credentials(code_verifier, authorization_expires_at)
+            token = credentials["ingest_token"]
             verify_ingest_token(token)
-        except ValueError as error:
+            save_classifier(credentials["classifier"])
+        except (OSError, UnicodeError, ValueError) as error:
             print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
             return 2
         block = managed_block(token, not has_environment)
@@ -567,9 +630,11 @@ def main():
         return 3
     try:
         code_verifier, authorization_expires_at = browser_sign_in()
-        token = wait_for_ingest_token(code_verifier, authorization_expires_at)
+        credentials = wait_for_setup_credentials(code_verifier, authorization_expires_at)
+        token = credentials["ingest_token"]
         verify_ingest_token(token)
-    except ValueError as error:
+        save_classifier(credentials["classifier"])
+    except (OSError, UnicodeError, ValueError) as error:
         print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
         return 2
 

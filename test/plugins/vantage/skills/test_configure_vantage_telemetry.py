@@ -38,14 +38,39 @@ class Response:
 
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
+    def setup_payload(self, ingest_token="secret-token"):
+        return {
+            "plaintext_token": ingest_token,
+            "classifier_read_token": "classifier-token",
+            "classifier_markdown": "# Current classifier\n",
+        }
+
+    def setup_credentials(self, ingest_token="new-token"):
+        return {
+            "ingest_token": ingest_token,
+            "classifier": {
+                "token": "classifier-token",
+                "markdown": b"# Current classifier\n",
+            },
+        }
+
     def authorization_expires_at(self):
         return int(MODULE.time.time()) + MODULE.AUTHORIZATION_TIMEOUT
 
-    def run_main(self, config=""):
+    def run_main(self, config="", configured_assets=False):
         with tempfile.TemporaryDirectory() as codex_home:
             path = pathlib.Path(codex_home) / "config.toml"
             if config:
                 path.write_text(config, encoding="utf-8")
+            if configured_assets:
+                vantage = pathlib.Path(codex_home) / "vantage"
+                vantage.mkdir()
+                (vantage / "classifier_read_token").write_text(
+                    "classifier-token", encoding="utf-8"
+                )
+                (vantage / "classifier.md").write_text(
+                    "# Current classifier\n", encoding="utf-8"
+                )
 
             stdout = io.StringIO()
             stderr = io.StringIO()
@@ -101,18 +126,22 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
         self.assertEqual("", stdout.getvalue())
 
-    def test_waits_until_vantage_returns_the_ingest_token(self):
+    def test_waits_until_vantage_returns_setup_credentials(self):
         responses = [
             Response(202, {"status": "pending"}),
-            Response(201, {"plaintext_token": "secret-token"}),
+            Response(201, self.setup_payload()),
         ]
 
         with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses) as urlopen:
             with mock.patch.object(MODULE.time, "sleep") as sleep:
                 authorization_expires_at = self.authorization_expires_at()
-                token = MODULE.wait_for_ingest_token("v" * 64, authorization_expires_at)
+                credentials = MODULE.wait_for_setup_credentials(
+                    "v" * 64, authorization_expires_at
+                )
 
-        self.assertEqual("secret-token", token)
+        self.assertEqual("secret-token", credentials["ingest_token"])
+        self.assertEqual("classifier-token", credentials["classifier"]["token"])
+        self.assertEqual(b"# Current classifier\n", credentials["classifier"]["markdown"])
         sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
         request = urlopen.call_args_list[0].args[0]
         request_payload = json.loads(request.data)
@@ -135,14 +164,16 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             Response(202, {"status": "pending"}),
             Response(202, {"status": "pending"}),
             Response(202, {"status": "pending"}),
-            Response(201, {"plaintext_token": "secret-token"}),
+            Response(201, self.setup_payload()),
         ]
 
         with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
             with mock.patch.object(MODULE.time, "sleep") as sleep:
-                token = MODULE.wait_for_ingest_token("v" * 64, self.authorization_expires_at())
+                credentials = MODULE.wait_for_setup_credentials(
+                    "v" * 64, self.authorization_expires_at()
+                )
 
-        self.assertEqual("secret-token", token)
+        self.assertEqual("secret-token", credentials["ingest_token"])
         self.assertEqual(
             [mock.call(2), mock.call(4), mock.call(8)],
             sleep.call_args_list,
@@ -156,20 +187,41 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             {},
             None,
         )
-        responses = [rate_limited, Response(201, {"plaintext_token": "secret-token"})]
+        responses = [rate_limited, Response(201, self.setup_payload())]
 
         with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
             with mock.patch.object(MODULE.time, "sleep") as sleep:
-                token = MODULE.wait_for_ingest_token("v" * 64, self.authorization_expires_at())
+                credentials = MODULE.wait_for_setup_credentials(
+                    "v" * 64, self.authorization_expires_at()
+                )
 
-        self.assertEqual("secret-token", token)
+        self.assertEqual("secret-token", credentials["ingest_token"])
+        sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
+
+    def test_retries_classifier_issuance_failure_with_backoff(self):
+        unavailable = MODULE.urllib.error.HTTPError(
+            MODULE.CLAIM_ENDPOINT,
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+        responses = [unavailable, Response(201, self.setup_payload())]
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                credentials = MODULE.wait_for_setup_credentials(
+                    "v" * 64, self.authorization_expires_at()
+                )
+
+        self.assertEqual("secret-token", credentials["ingest_token"])
         sleep.assert_called_once_with(MODULE.POLL_INTERVAL)
 
     def test_default_command_stops_when_plugin_configuration_exists(self):
         config = "[otel]\n%s\n" % "\n".join(MODULE.managed_block("existing-token", True))
 
         with mock.patch.object(MODULE, "browser_sign_in") as browser_sign_in:
-            status, stdout, stderr, result = self.run_main(config)
+            status, stdout, stderr, result = self.run_main(config, configured_assets=True)
 
         self.assertEqual(0, status)
         self.assertIn("already configured", stdout)
@@ -177,6 +229,28 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         self.assertEqual("", stderr)
         self.assertEqual(config, result)
         browser_sign_in.assert_not_called()
+
+    def test_configured_telemetry_requires_classifier_files(self):
+        config = "[otel]\n%s\n" % "\n".join(MODULE.managed_block("existing-token", True))
+
+        status, stdout, stderr, result = self.run_main(config)
+
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("classifier files are missing", stderr)
+        self.assertEqual(config, result)
+
+    def test_saves_classifier_credential_and_markdown_privately(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                MODULE.save_classifier(self.setup_credentials()["classifier"])
+                token_path = MODULE.classifier_token_path()
+                markdown_path = MODULE.classifier_markdown_path()
+
+            self.assertEqual("classifier-token", token_path.read_text(encoding="utf-8"))
+            self.assertEqual("# Current classifier\n", markdown_path.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, token_path.stat().st_mode & 0o777)
+            self.assertEqual(0o600, markdown_path.stat().st_mode & 0o777)
 
     def test_default_command_refreshes_an_existing_vantage_exporter(self):
         config = """[otel]
@@ -193,7 +267,11 @@ trace_exporter = "none"
             "browser_sign_in",
             return_value=("verifier", self.authorization_expires_at()),
         ):
-            with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
+            with mock.patch.object(
+                MODULE,
+                "wait_for_setup_credentials",
+                return_value=self.setup_credentials(),
+            ):
                 with mock.patch.object(MODULE, "verify_ingest_token"):
                     status, stdout, stderr, result = self.run_main(config)
 
@@ -218,7 +296,11 @@ trace_exporter = "none"
             "browser_sign_in",
             return_value=("verifier", self.authorization_expires_at()),
         ):
-            with mock.patch.object(MODULE, "wait_for_ingest_token", return_value="new-token"):
+            with mock.patch.object(
+                MODULE,
+                "wait_for_setup_credentials",
+                return_value=self.setup_credentials(),
+            ):
                 with mock.patch.object(MODULE, "verify_ingest_token"):
                     status, stdout, stderr, result = self.run_main()
 

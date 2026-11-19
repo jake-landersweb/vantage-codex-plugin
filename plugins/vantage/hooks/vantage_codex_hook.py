@@ -2,8 +2,9 @@
 """Send privacy-conscious Codex turn attribution to Vantage as an OTLP log.
 
 This hook never reads or sends prompts, responses, transcripts, tool data, or
-local paths. Failures never block or continue the Codex turn. It intentionally
-uses only the Python standard library.
+workspace files. It reads only the plugin-managed classifier and credentials.
+Failures never block or continue the Codex turn. It intentionally uses only the
+Python standard library.
 """
 
 import argparse
@@ -22,15 +23,18 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1"
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.4.0"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 EVENT_NAME = "codex.turn.attribution"
-PURPOSES = ("research", "development", "design", "unclassified")
-SOURCES = ("explicit", "inferred", "manual")
 DEFAULT_ENDPOINT = "https://ingest.vantage.sh"
+DEFAULT_CLASSIFIER_ENDPOINT = "https://api.vantage.sh/plugins/realtime_ai_classifier"
 INGEST_ENDPOINT = f"{DEFAULT_ENDPOINT}/v1/logs"
+MAX_CLASSIFIER_BYTES = 64 * 1024
+CLASSIFIER_TIMEOUT = 2
 TAG_SECONDS = 604_800
-SKILL_TAGS = ("purpose", "project", "source")
+MAX_CLASSIFICATION_TAGS = 32
+MAX_CLASSIFICATION_VALUE_LENGTH = 512
+CLASSIFICATION_TAG_KEY = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
 GITHUB_REPOSITORY = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 MANAGED_BLOCK = re.compile(
@@ -71,22 +75,20 @@ def tag(
     try:
         parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
         parser.add_argument("--session")
-        for name in SKILL_TAGS:
-            parser.add_argument(f"--{name}")
-        options = {
-            name: value.strip()
-            for name, value in vars(parser.parse_args(argv)).items()
-            if value is not None and value.strip()
-        }
-
-        session_id = options.pop("session", "")
+        parser.add_argument("--tag", action="append", default=[])
+        parsed = vars(parser.parse_args(argv))
+        session_id = (parsed.pop("session") or "").strip()
         if not session_id:
             raise ValueError("--session is required")
-        if options.get("purpose") not in (None, *PURPOSES):
-            raise ValueError(f"--purpose must be one of {', '.join(PURPOSES)}")
-        if options.get("source") not in (None, *SOURCES):
-            raise ValueError(f"--source must be one of {', '.join(SOURCES)}")
-        if not set(options).difference({"source"}):
+
+        raw_tags = parsed.pop("tag")
+        options = {}
+        for raw_tag in raw_tags:
+            key, separator, value = raw_tag.partition("=")
+            if not separator:
+                raise ValueError("--tag must use key=value")
+            add_classification_tag(options, key, value)
+        if not options:
             raise ValueError("give at least one tag")
 
         if not update_tags(env, session_id, options):
@@ -123,11 +125,8 @@ def build_request(
         [
             string_attribute("codex.turn.id", turn_id),
             string_attribute("vcs.ref.head.name", git.get("branch")),
-            string_attribute("vantage.purpose", skill.get("purpose")),
-            string_attribute("vantage.project", skill.get("project")),
-            string_attribute("vantage.tag_source", skill.get("source")),
         ]
-    )
+    ) + classification_attributes(skill)
     return envelope(
         EVENT_NAME,
         session_id,
@@ -183,8 +182,10 @@ def handle(
     events_path = str(env.get("VANTAGE_CODEX_EVENTS_PATH", "")).strip()
     if payload.get("hook_event_name") == "SessionStart":
         session_id = str(payload.get("session_id") or "").strip()
-        if session_id:
-            print(attribution_context(session_id), file=stdout)
+        refresh_classifier(env, stderr=stderr)
+        classifier = classifier_markdown_path(env)
+        if session_id and classifier.is_file():
+            print(attribution_context(session_id, classifier), file=stdout)
         return
 
     token = ingest_token(env)
@@ -244,6 +245,109 @@ def codex_home(env):
     return Path(configured or "~/.codex").expanduser()
 
 
+def classifier_directory(env):
+    return codex_home(env) / "vantage"
+
+
+def classifier_token_path(env):
+    return classifier_directory(env) / "classifier_read_token"
+
+
+def classifier_markdown_path(env):
+    return classifier_directory(env) / "classifier.md"
+
+
+def classifier_etag_path(env):
+    return classifier_directory(env) / "classifier.etag"
+
+
+def classifier_endpoint(env):
+    return (
+        str(env.get("VANTAGE_CLASSIFIER_ENDPOINT", "")).strip()
+        or DEFAULT_CLASSIFIER_ENDPOINT
+    )
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def refresh_classifier(env, stderr=sys.stderr):
+    cached = classifier_markdown_path(env).is_file()
+    try:
+        try:
+            token = classifier_token_path(env).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return cached
+        if not token:
+            return cached
+
+        endpoint = classifier_endpoint(env)
+        parsed = urllib.parse.urlparse(endpoint)
+        if not https_or_loopback(parsed):
+            raise ValueError(
+                f"refusing to send the classifier credential over {parsed.scheme}"
+            )
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": USER_AGENT,
+        }
+        try:
+            etag = classifier_etag_path(env).read_text(encoding="utf-8").strip()
+            if etag:
+                headers["If-None-Match"] = etag
+        except (OSError, UnicodeError):
+            pass
+
+        request = urllib.request.Request(endpoint, headers=headers, method="GET")
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        try:
+            response = opener.open(request, timeout=CLASSIFIER_TIMEOUT)
+        except urllib.error.HTTPError as error:
+            if error.code == 304:
+                return cached
+            raise
+
+        with response:
+            raw = response.read(MAX_CLASSIFIER_BYTES + 1)
+            if len(raw) > MAX_CLASSIFIER_BYTES:
+                raise ValueError("classifier response is too large")
+            payload = json.loads(raw.decode("utf-8"))
+            markdown = payload.get("classifier_markdown") if isinstance(payload, dict) else None
+            if not isinstance(markdown, str) or not markdown.strip():
+                raise ValueError("classifier response is empty")
+            write_private_file(classifier_markdown_path(env), markdown.encode("utf-8"))
+            new_etag = response.headers.get("ETag", "").strip()
+            if new_etag:
+                write_private_file(classifier_etag_path(env), new_etag.encode("utf-8"))
+        return True
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
+        print(
+            f"[vantage_codex_hook] classifier refresh failed: {type(error).__name__}",
+            file=stderr,
+        )
+        return cached
+
+
+def write_private_file(path, content):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def append_local(body, path):
     destination = Path(path)
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -257,12 +361,13 @@ def endpoint_for(env):
     return str(env.get("VANTAGE_CODEX_INGEST_ENDPOINT", "")).strip() or DEFAULT_ENDPOINT
 
 
-def attribution_context(session_id):
+def attribution_context(session_id, classifier):
     command = f'"{sys.executable}" "{Path(__file__).resolve()}" tag --session {session_id}'
     return (
         f"Vantage session attribution command for this Codex session: {command}\n"
-        "Use it only as the vantage-session-attribution skill directs, "
-        "appending that skill's flags."
+        f"Vantage classifier file for this session: {classifier}\n"
+        "Use the vantage-session-attribution skill to read that classifier and "
+        "append only the flags it directs."
     )
 
 
@@ -353,9 +458,49 @@ def skill_tags(env, session_id):
     try:
         current = json.loads((state_dir(env) / "tags.json").read_text(encoding="utf-8"))
         entry = current.get(session_id) if isinstance(current, dict) else None
-        return entry if isinstance(entry, dict) else {}
+        if not isinstance(entry, dict):
+            return {}
+        tagged_at = entry.get("at")
+        if not isinstance(tagged_at, int) or not 0 <= int(time.time()) - tagged_at <= TAG_SECONDS:
+            return {}
+        return {
+            key: value
+            for key, value in entry.items()
+            if key != "at" and valid_classification_tag(key, value)
+        }
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+
+
+def valid_classification_tag(key, value):
+    return (
+        isinstance(key, str)
+        and CLASSIFICATION_TAG_KEY.fullmatch(key) is not None
+        and isinstance(value, str)
+        and bool(value)
+        and len(value) <= MAX_CLASSIFICATION_VALUE_LENGTH
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def add_classification_tag(tags, key, value):
+    key = key.strip()
+    value = value.strip()
+    if not valid_classification_tag(key, value):
+        raise ValueError("classification tags require a lowercase key and a non-empty value")
+    if key not in tags and len(tags) >= MAX_CLASSIFICATION_TAGS:
+        raise ValueError(f"at most {MAX_CLASSIFICATION_TAGS} classification tags are allowed")
+    tags[key] = value
+
+
+def classification_attributes(tags):
+    return compact(
+        [
+            string_attribute(f"vantage.classification.{key}", value)
+            for key, value in sorted(tags.items())
+            if valid_classification_tag(key, value)
+        ]
+    )
 
 
 def update_tags(
@@ -381,10 +526,8 @@ def update_tags(
                 and isinstance(entry.get("at"), int)
                 and 0 <= now - entry["at"] <= TAG_SECONDS
             }
-            entry = current.pop(session_id, {})
-            if not isinstance(entry, dict):
-                entry = {}
-            current[session_id] = {**entry, **options, "at": now}
+            current.pop(session_id, None)
+            current[session_id] = {**options, "at": now}
             while len(current) > 200 and next(iter(current)) != session_id:
                 del current[next(iter(current))]
 
