@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Send privacy-conscious Codex turn attribution to Vantage as an OTLP log.
 
-This hook never reads or sends prompts, responses, transcripts, tool data, or
-workspace files. It reads only the plugin-managed classifier and credentials.
-Failures never block or continue the Codex turn. It intentionally uses only the
-Python standard library.
+This hook reads only structural turn metadata and token totals from Codex
+transcripts. It never sends prompts, responses, tool data, transcript paths, or
+workspace file contents. Failures never block or continue the Codex turn. It
+intentionally uses only the Python standard library.
 """
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -34,6 +35,7 @@ INGEST_ENDPOINT = f"{DEFAULT_ENDPOINT}/v1/logs"
 MAX_CLASSIFIER_BYTES = 64 * 1024
 CLASSIFIER_TIMEOUT = 2
 INGEST_TIMEOUT = 5
+SESSION_RETRY_TIMEOUT = 1
 TAG_SECONDS = 604_800
 TURN_STATE_VERSION = 1
 MAX_REGISTERED_TRANSCRIPTS = 50
@@ -112,50 +114,13 @@ def tag(
         return 1
 
 
-def build_request(
-    payload,
-    env=os.environ,
-    now_ns=None,
-):
-    if payload.get("hook_event_name") != "Stop":
-        return None
-
-    session_id = str(payload.get("session_id") or "").strip()
-    if not session_id:
-        return None
-
-    turn_id = str(payload.get("turn_id") or "").strip()
-    git = workspace_tags(str(payload.get("cwd") or "")) or {}
-    skill = skill_tags(env, session_id)
-    attributes = compact(
-        [
-            string_attribute("codex.turn.id", turn_id),
-            string_attribute(
-                "vantage.turn.logical_id",
-                turn_logical_id(session_id, turn_id) if turn_id else None,
-            ),
-            integer_attribute("vantage.turn.revision", 1),
-            string_attribute("vantage.turn.state", "partial"),
-            string_attribute("model", payload.get("model")),
-            string_attribute("vcs.ref.head.name", git.get("branch")),
-        ]
-    ) + classification_attributes(skill)
-    return envelope(
-        EVENT_NAME,
-        session_id,
-        git.get("repository"),
-        attributes,
-        now_ns if now_ns is not None else time.time_ns(),
-        "codex_hook",
-    )
-
-
 def deliver(
     body,
     *,
     token,
     endpoint,
     stderr=sys.stderr,
+    timeout=INGEST_TIMEOUT,
 ):
     url = urllib.parse.urljoin(endpoint, "/v1/logs")
     parsed = urllib.parse.urlparse(url)
@@ -173,7 +138,7 @@ def deliver(
         method="POST",
     )
     try:
-        response = urllib.request.urlopen(request, timeout=INGEST_TIMEOUT)
+        response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         print(f"[vantage_codex_hook] ingest responded {error.code}", file=stderr)
         return error
@@ -199,13 +164,47 @@ def handle(
         classifier = classifier_markdown_path(env)
         if session_id and classifier.is_file():
             print(attribution_context(session_id, classifier), file=stdout)
+        if outbox_path(env).is_file():
+            retry_outbox(
+                env,
+                events_path=events_path,
+                stderr=stderr,
+                timeout=SESSION_RETRY_TIMEOUT,
+            )
         return
 
     token = ingest_token(env)
     if not events_path and not token:
         return
 
-    bodies = turn_requests(payload, env=env, now_ns=now_ns)
+    with turn_state_lock(env):
+        bodies = turn_requests(payload, env=env, now_ns=now_ns)
+        flush_outbox(
+            env,
+            bodies,
+            events_path=events_path,
+            token=token,
+            stderr=stderr,
+            timeout=INGEST_TIMEOUT,
+        )
+
+
+def retry_outbox(env, *, events_path, stderr, timeout):
+    token = "" if events_path else ingest_token(env)
+    if not events_path and not token:
+        return
+    with turn_state_lock(env):
+        flush_outbox(
+            env,
+            load_outbox(env),
+            events_path=events_path,
+            token=token,
+            stderr=stderr,
+            timeout=timeout,
+        )
+
+
+def flush_outbox(env, bodies, *, events_path, token, stderr, timeout):
     if not bodies:
         return
     if events_path:
@@ -213,24 +212,29 @@ def handle(
             append_local(body, events_path)
         save_outbox(env, [])
         return
+    try:
+        response = deliver(
+            batch_requests(bodies),
+            token=token,
+            endpoint=endpoint_for(env),
+            stderr=stderr,
+            timeout=timeout,
+        )
+        status = getattr(response, "status", 200)
+        if 200 <= status < 300:
+            save_outbox(env, [])
+            return
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
+    save_outbox(env, bodies)
 
-    pending = []
-    for index, body in enumerate(bodies):
-        try:
-            response = deliver(
-                body,
-                token=token,
-                endpoint=endpoint_for(env),
-                stderr=stderr,
-            )
-            status = getattr(response, "status", 200)
-            if not 200 <= status < 300:
-                pending.extend(bodies[index:])
-                break
-        except (OSError, ValueError, urllib.error.URLError):
-            pending.extend(bodies[index:])
-            break
-    save_outbox(env, pending)
+
+def batch_requests(bodies):
+    resource_logs = []
+    for body in bodies:
+        if isinstance(body, dict) and isinstance(body.get("resourceLogs"), list):
+            resource_logs.extend(body["resourceLogs"])
+    return {"resourceLogs": resource_logs}
 
 
 def turn_requests(payload, env=os.environ, now_ns=None):
@@ -554,6 +558,16 @@ def turn_state_path(env):
 
 def outbox_path(env):
     return turn_state_path(env).with_name("turn_outbox.json")
+
+
+@contextlib.contextmanager
+def turn_state_lock(env):
+    path = turn_state_path(env).with_name("turn_state.lock")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a+") as handle:
+        lock_file(handle)
+        yield
 
 
 def load_turn_state(env):

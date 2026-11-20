@@ -1,3 +1,4 @@
+import concurrent.futures
 import importlib.util
 import io
 import json
@@ -677,6 +678,86 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
             )
         deliver.assert_called_once()
         self.assertFalse(HOOK.outbox_path(env).exists())
+
+    def test_session_start_retries_the_outbox_once_with_a_short_timeout(self):
+        codex_home = self.directory / "codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            "[otel]\nexporter = { otlp-http = { endpoint = \"https://ingest.vantage.sh/v1/logs\", headers = { authorization = \"Bearer vntg_ti_REPLAY_CREDENTIAL\" } } }\n",
+            encoding="utf-8",
+        )
+        env = {
+            "CODEX_HOME": str(codex_home),
+            "VANTAGE_CODEX_HOOK_STATE_DIR": str(self.state_directory),
+        }
+        first = HOOK.envelope(
+            HOOK.EVENT_NAME, "session-1", None, [], 1, "codex_hook"
+        )
+        second = HOOK.envelope(
+            HOOK.EVENT_NAME, "session-2", None, [], 2, "codex_hook"
+        )
+        HOOK.save_outbox(env, [first, second])
+
+        with mock.patch.object(
+            HOOK, "deliver", return_value=mock.Mock(status=200)
+        ) as deliver:
+            HOOK.run(
+                stdin=io.StringIO(
+                    json.dumps(
+                        {"hook_event_name": "SessionStart", "session_id": "session-3"}
+                    )
+                ),
+                env=env,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+
+        deliver.assert_called_once()
+        self.assertEqual(
+            HOOK.SESSION_RETRY_TIMEOUT, deliver.call_args.kwargs["timeout"]
+        )
+        self.assertEqual(2, len(deliver.call_args.args[0]["resourceLogs"]))
+        self.assertFalse(HOOK.outbox_path(env).exists())
+
+    def test_parallel_stops_preserve_every_turn_and_local_event(self):
+        env = {
+            "VANTAGE_CODEX_EVENTS_PATH": str(self.directory / "events.jsonl"),
+            "VANTAGE_CODEX_HOOK_STATE_DIR": str(self.state_directory),
+        }
+
+        def stop(index):
+            HOOK.run(
+                stdin=io.StringIO(
+                    json.dumps(
+                        {
+                            "hook_event_name": "Stop",
+                            "session_id": f"session-{index}",
+                            "turn_id": f"turn-{index}",
+                        }
+                    )
+                ),
+                env=env,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                now_ns=index + 1,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(stop, range(20)))
+
+        state = HOOK.load_turn_state(env)
+        events = (self.directory / "events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(20, len(state["turns"]))
+        self.assertEqual(20, len(events))
+        self.assertEqual(
+            {"1"},
+            {
+                self.event_attributes(json.loads(event))["vantage.turn.revision"]
+                for event in events
+            },
+        )
 
     def test_rejects_removed_work_item_tags(self):
         removed_tags = (
