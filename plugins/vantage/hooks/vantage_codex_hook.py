@@ -8,6 +8,8 @@ Python standard library.
 """
 
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import re
@@ -23,7 +25,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 EVENT_NAME = "codex.turn.attribution"
 DEFAULT_ENDPOINT = "https://ingest.vantage.sh"
@@ -31,7 +33,11 @@ DEFAULT_CLASSIFIER_ENDPOINT = "https://api.vantage.sh/plugins/realtime_ai_classi
 INGEST_ENDPOINT = f"{DEFAULT_ENDPOINT}/v1/logs"
 MAX_CLASSIFIER_BYTES = 64 * 1024
 CLASSIFIER_TIMEOUT = 2
+INGEST_TIMEOUT = 5
 TAG_SECONDS = 604_800
+TURN_STATE_VERSION = 1
+MAX_REGISTERED_TRANSCRIPTS = 50
+MAX_OUTBOX_RECORDS = 100
 MAX_CLASSIFICATION_TAGS = 32
 MAX_CLASSIFICATION_VALUE_LENGTH = 512
 CLASSIFICATION_TAG_KEY = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
@@ -124,6 +130,12 @@ def build_request(
     attributes = compact(
         [
             string_attribute("codex.turn.id", turn_id),
+            string_attribute(
+                "vantage.turn.logical_id",
+                turn_logical_id(session_id, turn_id) if turn_id else None,
+            ),
+            integer_attribute("vantage.turn.revision", 1),
+            string_attribute("vantage.turn.state", "partial"),
             string_attribute("vcs.ref.head.name", git.get("branch")),
         ]
     ) + classification_attributes(skill)
@@ -160,7 +172,7 @@ def deliver(
         method="POST",
     )
     try:
-        response = urllib.request.urlopen(request, timeout=30)
+        response = urllib.request.urlopen(request, timeout=INGEST_TIMEOUT)
     except urllib.error.HTTPError as error:
         print(f"[vantage_codex_hook] ingest responded {error.code}", file=stderr)
         return error
@@ -192,14 +204,431 @@ def handle(
     if not events_path and not token:
         return
 
-    body = build_request(payload, env=env, now_ns=now_ns)
-    if body is None:
+    bodies = turn_requests(payload, env=env, now_ns=now_ns)
+    if not bodies:
         return
     if events_path:
-        append_local(body, events_path)
+        for body in bodies:
+            append_local(body, events_path)
+        save_outbox(env, [])
         return
 
-    deliver(body, token=token, endpoint=endpoint_for(env), stderr=stderr)
+    pending = []
+    for index, body in enumerate(bodies):
+        try:
+            response = deliver(
+                body,
+                token=token,
+                endpoint=endpoint_for(env),
+                stderr=stderr,
+            )
+            status = getattr(response, "status", 200)
+            if not 200 <= status < 300:
+                pending.extend(bodies[index:])
+                break
+        except (OSError, ValueError, urllib.error.URLError):
+            pending.extend(bodies[index:])
+            break
+    save_outbox(env, pending)
+
+
+def turn_requests(payload, env=os.environ, now_ns=None):
+    if payload.get("hook_event_name") != "Stop":
+        return load_outbox(env)
+
+    session_id = str(payload.get("session_id") or "").strip()
+    turn_id = str(payload.get("turn_id") or "").strip()
+    if not session_id or not turn_id:
+        return load_outbox(env)
+
+    git = workspace_tags(str(payload.get("cwd") or "")) or {}
+    tags = skill_tags(env, session_id)
+    state = load_turn_state(env)
+    changed = update_turn_state(
+        state,
+        payload,
+        now_ns if now_ns is not None else time.time_ns(),
+    )
+    requests = []
+    for summary in changed:
+        summary_turn_id = str(summary.get("turn_id") or "").strip()
+        if not summary_turn_id:
+            continue
+        summary_session_id = str(summary.get("session_id") or session_id).strip()
+        signature = turn_signature(summary, git, tags)
+        if summary.get("emitted_signature") == signature:
+            continue
+        revision = max(int(summary.get("revision") or 0), 0) + 1
+        summary["revision"] = revision
+        summary["emitted_signature"] = signature
+        attributes = turn_summary_attributes(summary, git, tags)
+        requests.append(
+            envelope(
+                EVENT_NAME,
+                summary_session_id,
+                git.get("repository"),
+                attributes,
+                now_ns if now_ns is not None else time.time_ns(),
+                "codex_hook",
+            )
+        )
+
+    queued = deduplicate_requests(load_outbox(env) + requests)
+    save_outbox(env, queued)
+    save_turn_state(env, state)
+    return queued
+
+
+def transcript_file(payload):
+    raw = str(payload.get("transcript_path") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def update_turn_state(state, payload, stopped_at_ns):
+    session_id = str(payload.get("session_id") or "").strip()
+    current_turn_id = str(payload.get("turn_id") or "").strip()
+    path = transcript_file(payload)
+    changed_ids = set()
+    current_start_ns = stopped_at_ns
+
+    if path is not None:
+        transcript_key = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+        transcripts = state.setdefault("transcripts", {})
+        transcript = transcripts.setdefault(
+            transcript_key,
+            {"path": str(path.resolve()), "offset": 0, "session_id": session_id},
+        )
+        transcript["path"] = str(path.resolve())
+        transcript["session_id"] = session_id
+        offset = max(int(transcript.get("offset") or 0), 0)
+        try:
+            size = path.stat().st_size
+            if size < offset:
+                offset = 0
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        handle.seek(line_start)
+                        break
+                    offset = handle.tell()
+                    try:
+                        record = json.loads(line.decode("utf-8"))
+                    except (UnicodeError, json.JSONDecodeError):
+                        continue
+                    changed_ids.update(apply_transcript_record(state, session_id, record))
+            transcript["offset"] = offset
+            transcript["seen_at_ns"] = stopped_at_ns
+        except OSError:
+            pass
+        prune_transcripts(transcripts)
+
+    turns = state.setdefault("turns", {})
+    current_key = turn_key(session_id, current_turn_id)
+    current = turns.setdefault(
+        current_key,
+        new_turn_summary(session_id, current_turn_id, stopped_at_ns),
+    )
+    if path is None:
+        current["last_seen_ns"] = max(
+            int(current.get("last_seen_ns") or 0), stopped_at_ns
+        )
+    current_start_ns = int(current.get("started_at_ns") or stopped_at_ns)
+    changed_ids.add(current_key)
+
+    for key, summary in turns.items():
+        if key == current_key or summary.get("state") == "completed":
+            continue
+        if str(summary.get("session_id") or "") != session_id:
+            continue
+        last_seen_ns = int(summary.get("last_seen_ns") or 0)
+        if last_seen_ns and last_seen_ns < current_start_ns:
+            summary["state"] = "interrupted"
+            summary["ended_at_ns"] = last_seen_ns
+            summary["recovered"] = True
+            changed_ids.add(key)
+
+    changed = [turns[key] for key in changed_ids if key in turns]
+    changed.sort(key=lambda value: (int(value.get("started_at_ns") or 0), value.get("turn_id", "")))
+    return changed
+
+
+def apply_transcript_record(state, session_id, record):
+    if not isinstance(record, dict):
+        return set()
+    record_type = record.get("type")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return set()
+    timestamp_ns = parse_timestamp_ns(record.get("timestamp"))
+    if timestamp_ns is None:
+        return set()
+
+    root_turn_id = str(payload.get("root_turn_id") or payload.get("turn_id") or "").strip()
+    if not root_turn_id:
+        attribution = payload.get("turn_attribution")
+        if isinstance(attribution, dict):
+            root_turn_id = str(
+                attribution.get("root_turn_id") or attribution.get("turn_id") or ""
+            ).strip()
+    if not root_turn_id:
+        return set()
+
+    key = turn_key(session_id, root_turn_id)
+    turns = state.setdefault("turns", {})
+    summary = turns.setdefault(
+        key,
+        new_turn_summary(session_id, root_turn_id, timestamp_ns),
+    )
+    summary["started_at_ns"] = min(
+        int(summary.get("started_at_ns") or timestamp_ns), timestamp_ns
+    )
+    summary["last_seen_ns"] = max(
+        int(summary.get("last_seen_ns") or 0), timestamp_ns
+    )
+
+    event_type = str(payload.get("type") or "")
+    event_turn_id = str(payload.get("turn_id") or "").strip()
+    if (
+        record_type == "event_msg"
+        and event_type == "task_started"
+        and event_turn_id == root_turn_id
+    ):
+        summary["started_at_ns"] = timestamp_ns
+    elif (
+        record_type == "event_msg"
+        and event_type == "task_complete"
+        and event_turn_id == root_turn_id
+    ):
+        summary["state"] = "completed"
+        summary["ended_at_ns"] = timestamp_ns
+    elif record_type == "token_usage_record":
+        leaf_turn_id = str(payload.get("turn_id") or root_turn_id).strip()
+        usage = payload.get("turn_token_usage")
+        if isinstance(usage, dict):
+            leaves = summary.setdefault("leaf_usage", {})
+            previous = leaves.get(leaf_turn_id)
+            if not isinstance(previous, dict) or timestamp_ns >= int(previous.get("at_ns") or 0):
+                leaves[leaf_turn_id] = {
+                    "at_ns": timestamp_ns,
+                    "input_tokens": nonnegative_int(usage.get("input_tokens")),
+                    "cached_input_tokens": nonnegative_int(usage.get("cached_input_tokens")),
+                    "cache_write_input_tokens": nonnegative_int(usage.get("cache_write_input_tokens")),
+                    "output_tokens": nonnegative_int(usage.get("output_tokens")),
+                    "reasoning_output_tokens": nonnegative_int(usage.get("reasoning_output_tokens")),
+                    "total_tokens": nonnegative_int(usage.get("total_tokens")),
+                }
+        response_id = str(payload.get("response_id") or "").strip()
+        if response_id:
+            responses = summary.setdefault("response_ids", [])
+            if response_id not in responses:
+                responses.append(response_id)
+    return {key}
+
+
+def new_turn_summary(session_id, turn_id, timestamp_ns):
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "started_at_ns": timestamp_ns,
+        "last_seen_ns": timestamp_ns,
+        "ended_at_ns": 0,
+        "state": "partial",
+        "recovered": False,
+        "leaf_usage": {},
+        "response_ids": [],
+        "revision": 0,
+    }
+
+
+def turn_summary_attributes(summary, git, tags):
+    usage = turn_usage(summary)
+    session_id = str(summary.get("session_id") or "")
+    turn_id = str(summary.get("turn_id") or "")
+    values = [
+        string_attribute("codex.turn.id", turn_id),
+        string_attribute("vantage.turn.logical_id", turn_logical_id(session_id, turn_id)),
+        integer_attribute("vantage.turn.revision", summary.get("revision")),
+        string_attribute("vantage.turn.state", summary.get("state")),
+        boolean_attribute("vantage.turn.recovered", bool(summary.get("recovered"))),
+        integer_attribute("codex.turn.started_at_unix_nano", summary.get("started_at_ns")),
+        integer_attribute("codex.turn.ended_at_unix_nano", summary.get("ended_at_ns")),
+        integer_attribute("codex.turn.request_count", len(summary.get("response_ids") or [])),
+        integer_attribute("codex.turn.input_token_count", usage["input_tokens"]),
+        integer_attribute("codex.turn.cached_input_token_count", usage["cached_input_tokens"]),
+        integer_attribute("codex.turn.cache_write_input_token_count", usage["cache_write_input_tokens"]),
+        integer_attribute("codex.turn.output_token_count", usage["output_tokens"]),
+        integer_attribute("codex.turn.reasoning_output_token_count", usage["reasoning_output_tokens"]),
+        integer_attribute("codex.turn.total_token_count", usage["total_tokens"]),
+        string_attribute("vcs.ref.head.name", git.get("branch")),
+    ]
+    return compact(values) + classification_attributes(tags)
+
+
+def turn_usage(summary):
+    totals = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+    }
+    leaves = summary.get("leaf_usage")
+    if not isinstance(leaves, dict):
+        return totals
+    for usage in leaves.values():
+        if not isinstance(usage, dict):
+            continue
+        for key in totals:
+            totals[key] += nonnegative_int(usage.get(key))
+    return totals
+
+
+def turn_signature(summary, git, tags):
+    value = {
+        "turn_id": summary.get("turn_id"),
+        "started_at_ns": summary.get("started_at_ns"),
+        "ended_at_ns": summary.get("ended_at_ns"),
+        "state": summary.get("state"),
+        "recovered": bool(summary.get("recovered")),
+        "request_count": len(summary.get("response_ids") or []),
+        "usage": turn_usage(summary),
+        "repository": git.get("repository"),
+        "branch": git.get("branch"),
+        "tags": tags,
+    }
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def turn_logical_id(session_id, turn_id):
+    value = f"codex:{session_id}:{turn_id}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def turn_key(session_id, turn_id):
+    return f"{session_id}:{turn_id}"
+
+
+def parse_timestamp_ns(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1_000_000_000)
+    except (ValueError, OverflowError):
+        return None
+
+
+def nonnegative_int(value):
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def turn_state_path(env):
+    configured = str(env.get("VANTAGE_CODEX_HOOK_STATE_DIR", "")).strip()
+    directory = Path(configured) if configured else classifier_directory(env)
+    return directory / "turn_state.json"
+
+
+def outbox_path(env):
+    return turn_state_path(env).with_name("turn_outbox.json")
+
+
+def load_turn_state(env):
+    try:
+        value = json.loads(turn_state_path(env).read_text(encoding="utf-8"))
+        if isinstance(value, dict) and value.get("version") == TURN_STATE_VERSION:
+            value.setdefault("transcripts", {})
+            value.setdefault("turns", {})
+            return value
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    return {"version": TURN_STATE_VERSION, "transcripts": {}, "turns": {}}
+
+
+def save_turn_state(env, state):
+    prune_turns(state.setdefault("turns", {}))
+    write_private_file(
+        turn_state_path(env),
+        json.dumps(state, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+    )
+
+
+def load_outbox(env):
+    try:
+        value = json.loads(outbox_path(env).read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+
+
+def save_outbox(env, bodies):
+    bodies = deduplicate_requests(bodies)[-MAX_OUTBOX_RECORDS:]
+    if not bodies:
+        try:
+            outbox_path(env).unlink()
+        except FileNotFoundError:
+            pass
+        return
+    write_private_file(
+        outbox_path(env),
+        json.dumps(bodies, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def deduplicate_requests(bodies):
+    seen = set()
+    output = []
+    for body in bodies:
+        event_id = request_attribute(body, "vantage.event_id")
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        output.append(body)
+    return output
+
+
+def request_attribute(body, key):
+    try:
+        attributes = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
+        for attribute in attributes:
+            if attribute.get("key") == key:
+                value = attribute.get("value")
+                if isinstance(value, dict):
+                    return str(value.get("stringValue") or "")
+    except (KeyError, IndexError, TypeError):
+        pass
+    return ""
+
+
+def prune_transcripts(transcripts):
+    while len(transcripts) > MAX_REGISTERED_TRANSCRIPTS:
+        oldest = min(
+            transcripts,
+            key=lambda key: int(transcripts[key].get("seen_at_ns") or 0),
+        )
+        del transcripts[oldest]
+
+
+def prune_turns(turns):
+    maximum = MAX_REGISTERED_TRANSCRIPTS * 50
+    while len(turns) > maximum:
+        oldest = min(turns, key=lambda key: int(turns[key].get("last_seen_ns") or 0))
+        del turns[oldest]
 
 
 def ingest_token(env):
@@ -584,6 +1013,20 @@ def string_attribute(key, value):
     if not text:
         return None
     return {"key": key, "value": {"stringValue": text}}
+
+
+def integer_attribute(key, value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number < 0:
+        return None
+    return {"key": key, "value": {"intValue": str(number)}}
+
+
+def boolean_attribute(key, value):
+    return {"key": key, "value": {"boolValue": bool(value)}}
 
 
 def compact(values):
