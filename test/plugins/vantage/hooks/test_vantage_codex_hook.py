@@ -386,6 +386,15 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
                     },
                 },
                 {
+                    "timestamp": "2026-11-20T15:00:00.100Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "turn-1",
+                        "root_turn_id": "turn-1",
+                        "model": "gpt-6.2-sol",
+                    },
+                },
+                {
                     "timestamp": "2026-11-20T15:00:01.000Z",
                     "type": "token_usage_record",
                     "payload": {
@@ -417,6 +426,15 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
                             "reasoning_output_tokens": 2,
                             "total_tokens": 20,
                         },
+                    },
+                },
+                {
+                    "timestamp": "2026-11-20T15:00:02.500Z",
+                    "type": "turn_context",
+                    "payload": {
+                        "turn_id": "subturn-1",
+                        "root_turn_id": "turn-1",
+                        "model": "codex-auto-review",
                     },
                 },
                 {
@@ -484,6 +502,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs", headers = {
         self.assertEqual("8", attributes["codex.turn.cached_input_token_count"])
         self.assertEqual("8", attributes["codex.turn.output_token_count"])
         self.assertEqual("30", attributes["codex.turn.total_token_count"])
+        self.assertEqual("gpt-6.2-sol", attributes["model"])
         self.assertEqual(
             HOOK.turn_logical_id("session-1", "turn-1"),
             attributes["vantage.turn.logical_id"],

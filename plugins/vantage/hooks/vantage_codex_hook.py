@@ -136,6 +136,7 @@ def build_request(
             ),
             integer_attribute("vantage.turn.revision", 1),
             string_attribute("vantage.turn.state", "partial"),
+            string_attribute("model", payload.get("model")),
             string_attribute("vcs.ref.head.name", git.get("branch")),
         ]
     ) + classification_attributes(skill)
@@ -399,7 +400,11 @@ def apply_transcript_record(state, session_id, record):
 
     event_type = str(payload.get("type") or "")
     event_turn_id = str(payload.get("turn_id") or "").strip()
-    if (
+    if record_type == "turn_context" and event_turn_id == root_turn_id:
+        model = str(payload.get("model") or "").strip()
+        if model:
+            summary["model"] = model
+    elif (
         record_type == "event_msg"
         and event_type == "task_started"
         and event_turn_id == root_turn_id
@@ -445,6 +450,7 @@ def new_turn_summary(session_id, turn_id, timestamp_ns):
         "ended_at_ns": 0,
         "state": "partial",
         "recovered": False,
+        "model": "",
         "leaf_usage": {},
         "response_ids": [],
         "revision": 0,
@@ -470,6 +476,7 @@ def turn_summary_attributes(summary, git, tags):
         integer_attribute("codex.turn.output_token_count", usage["output_tokens"]),
         integer_attribute("codex.turn.reasoning_output_token_count", usage["reasoning_output_tokens"]),
         integer_attribute("codex.turn.total_token_count", usage["total_tokens"]),
+        string_attribute("model", summary.get("model")),
         string_attribute("vcs.ref.head.name", git.get("branch")),
     ]
     return compact(values) + classification_attributes(tags)
@@ -502,6 +509,7 @@ def turn_signature(summary, git, tags):
         "ended_at_ns": summary.get("ended_at_ns"),
         "state": summary.get("state"),
         "recovered": bool(summary.get("recovered")),
+        "model": summary.get("model"),
         "request_count": len(summary.get("response_ids") or []),
         "usage": turn_usage(summary),
         "repository": git.get("repository"),
