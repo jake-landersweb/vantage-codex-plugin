@@ -131,7 +131,7 @@ class VantageCodexHookTest(unittest.TestCase):
 
     def test_launcher_uses_the_newest_declared_plugin_version(self):
         codex_home = self.directory / "codex"
-        cache_root = codex_home / "plugins" / "cache" / "workspace-directory" / "vantage"
+        cache_root = codex_home / "plugins" / "cache" / "vantage-codex-plugin" / "vantage"
         old_plugin = cache_root / "999-not-a-version"
         new_plugin = cache_root / "carton-at-the-back"
         old_hooks = old_plugin / "hooks"

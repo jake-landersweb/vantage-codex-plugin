@@ -61,6 +61,7 @@ def plugin_roots(env):
 
     for cache_root in (
         codex_home / "plugins" / "cache" / "workspace-directory" / "vantage",
+        codex_home / "plugins" / "cache" / "vantage-codex-plugin" / "vantage",
         codex_home / "plugins" / "cache" / "vantage-codex-plugin",
     ):
         try:
