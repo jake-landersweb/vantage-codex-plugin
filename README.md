@@ -41,7 +41,7 @@ Python 3.9+, and curl with HTTP/2 support.
 ## What gets recorded
 
 Each user prompt opens a turn snapshot. The hook captures Git and developer
-identity observations, model request fingerprints, and classifier tags. Setup
+identity observations (including the effective Git `user.name` and `user.email`), model request fingerprints, and classifier tags. Setup
 installs the account classifier and refreshes its cached Markdown on session
 start. Within a session, a new turn inherits the previous prompt's classification
 when the worktree, branch, and classifier contents match. Ordinary commits on

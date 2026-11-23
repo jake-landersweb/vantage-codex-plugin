@@ -142,18 +142,19 @@ class HookTest(unittest.TestCase):
     ):
         subprocess.run(["git", "init", "-q", self.root], check=True)
 
-        def configure(email):
+        def configure(email, name):
+            subprocess.run(["git", "-C", self.root, "config", "user.name", name], check=True)
             subprocess.run(
                 ["git", "-C", self.root, "config", "user.email", email], check=True
             )
 
         p = {"session_id": "a", "turn_id": "b", "cwd": str(self.root)}
         key = ("codex", "a", "b")
-        configure("git-a@example.invalid")
+        configure("git-a@example.invalid", "Dev A")
         handle(self.db, "codex", dict(p, hook_event_name="UserPromptSubmit"))
         handle(self.db, "codex", dict(p, hook_event_name="PostModelRequest"))
         earlier = self.db.execute("SELECT max(timestamp) FROM outbox").fetchone()[0]
-        configure("git-b@example.invalid")
+        configure("git-b@example.invalid", "Dev B")
         handle(self.db, "codex", dict(p, hook_event_name="Stop"))
         with store.write(self.db):
             store.snapshot(self.db, key, tags={"ticket": "A-1"})
@@ -173,9 +174,12 @@ class HookTest(unittest.TestCase):
             ],
         )
         self.assertEqual(self.payloads()[-2]["git.identity.source"], "unknown")
-        configure("invalid input")
+        self.assertEqual([e.get("git.user.name") for e in self.payloads()],
+                         ["Dev A", "Dev A", "Dev B", "Dev B", None, "Dev A"])
+        configure("invalid input", "")
         handle(self.db, "codex", dict(p, hook_event_name="PostModelRequest"))
         self.assertNotIn("git.user.email", self.payloads()[-1])
+        self.assertNotIn("git.user.name", self.payloads()[-1])
 
     def test_request_model_switch_survives_retry(self):
         p = {"session_id": "s", "turn_id": "t", "hook_event_name": "PostModelRequest",

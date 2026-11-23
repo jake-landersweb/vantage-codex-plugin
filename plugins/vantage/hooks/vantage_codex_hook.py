@@ -68,13 +68,13 @@ def identifier(value):
     )
 
 
-def git_email(cwd):
+def git_identity(cwd):
     """Read the effective config in the agent's worktree; never inspect commit authors."""
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
         return None  # No observation. Keep any earlier observation for this turn.
     try:
         result = subprocess.run(
-            ["git", "-C", cwd, "config", "--get", "user.email"],
+            ["git", "-C", cwd, "config", "--null", "--get-regexp", r"^user\.(name|email)$"],
             capture_output=True,
             text=True,
             timeout=2,
@@ -82,14 +82,16 @@ def git_email(cwd):
         )
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
-    email = result.stdout.rstrip("\r\n")
-    if (
-        result.returncode == 0
-        and len(email) <= 254
-        and re.fullmatch(r"[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+", email)
-    ):
-        return email
-    return ""  # Missing/invalid config clears a previous observation.
+    if result.returncode not in (0, 1):
+        return None
+    fields = dict(entry.split("\n", 1) for entry in result.stdout.split("\0") if "\n" in entry)
+    email = fields.get("user.email", "")
+    name = fields.get("user.name", "").strip()
+    if len(email) > 254 or not re.fullmatch(r"[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+", email):
+        email = ""
+    if len(name.encode()) > 256 or not name.isprintable():
+        name = ""
+    return email, name
 
 
 def git_facts(cwd, salt):
@@ -298,6 +300,9 @@ def connect():
         CREATE TABLE IF NOT EXISTS git_identity (
             agent TEXT, session TEXT, turn TEXT, at_ns INTEGER, email TEXT NOT NULL,
             PRIMARY KEY(agent, session, turn, at_ns));
+        CREATE TABLE IF NOT EXISTS git_names (
+            agent TEXT, session TEXT, turn TEXT, at_ns INTEGER, name TEXT NOT NULL,
+            PRIMARY KEY(agent, session, turn, at_ns));
         CREATE TABLE IF NOT EXISTS install (id INTEGER PRIMARY KEY, salt BLOB NOT NULL);
         INSERT OR IGNORE INTO install VALUES (1,randomblob(16));
         CREATE TABLE IF NOT EXISTS diagnostics (name TEXT PRIMARY KEY, count INTEGER);
@@ -327,13 +332,18 @@ def write(db):
         raise
 
 
-def observed_email(db, key, at_ns):
+def observed_identity(db, key, at_ns):
     row = db.execute(
         "SELECT email FROM git_identity WHERE agent=? AND session=? AND turn=? "
         "AND at_ns<=? ORDER BY at_ns DESC LIMIT 1",
         (*key, at_ns),
     ).fetchone()
-    return row[0] if row else ""
+    name = db.execute(
+        "SELECT name FROM git_names WHERE agent=? AND session=? AND turn=? "
+        "AND at_ns<=? ORDER BY at_ns DESC LIMIT 1",
+        (*key, at_ns),
+    ).fetchone()
+    return (row[0] if row else ""), (name[0] if name else "")
 
 
 @lru_cache(maxsize=1)
@@ -346,14 +356,14 @@ def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
     agent, session, turn = key
     event_id = event_id or str(uuid.uuid4())
     timestamp = timestamp if timestamp is not None else time.time_ns()
-    email = observed_email(db, key, timestamp)
+    email, name = observed_identity(db, key, timestamp)
     version = db.execute("SELECT version FROM versions_at WHERE agent=? AND session=? AND at_ns<=? "
                          "ORDER BY at_ns DESC LIMIT 1", (*key[:2], timestamp)).fetchone()
     models = [row[0] for row in db.execute("SELECT model FROM turn_models WHERE agent=? AND session=? AND turn=?", key)]
     turn_model = models[0] if len(models) == 1 else "multiple" if models else "unknown"
     summary = kind == TURN
     payload = {
-        "git.identity.source": "git_config" if email else "unknown",
+        "git.identity.source": "git_config" if email or name else "unknown",
         "agent.version": version[0] if version else "unknown",
         "model.source": ("turn" if models else "unknown") if summary else ("request" if attrs.get("model") else "unknown"),
         "model": turn_model if summary else "unknown",
@@ -369,6 +379,8 @@ def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
         "turn.id": turn,
         **attrs,
     }
+    if name:
+        payload["git.user.name"] = name
     if email:
         payload["git.user.email"] = email
     db.execute(
@@ -835,7 +847,7 @@ def handle(db, name, payload):
     observe = turn and (
         first or tool or event in {"UserPromptSubmit", "Stop", "SessionEnd"}
     )
-    email = git_email(payload.get("cwd")) if turn else None
+    identity = git_identity(payload.get("cwd")) if turn else None
     facts = None
     if observe:
         salt = db.execute("SELECT salt FROM install WHERE id=1").fetchone()[0]
@@ -857,7 +869,9 @@ def handle(db, name, payload):
                 db.execute("INSERT OR IGNORE INTO turn_models VALUES (?,?,?,?)", (*key, model))
                 changes["models"] = [r[0] for r in db.execute(
                     "SELECT model FROM turn_models WHERE agent=? AND session=? AND turn=? ORDER BY model", key)]
-            if email is not None and email != observed_email(db, key, now):
+            if identity is not None and identity != observed_identity(db, key, now):
+                email, git_name = identity
+                db.execute("INSERT OR REPLACE INTO git_names VALUES (?,?,?,?,?)", (*key, now, git_name))
                 db.execute(
                     "INSERT OR REPLACE INTO git_identity VALUES (?,?,?,?,?)",
                     (*key, now, email),
