@@ -289,6 +289,10 @@ def connect():
         CREATE TABLE IF NOT EXISTS turns (
             agent TEXT, session TEXT, turn TEXT, revision INTEGER, state TEXT,
             PRIMARY KEY(agent, session, turn));
+        CREATE TABLE IF NOT EXISTS prompt_contexts (
+            agent TEXT, session TEXT, turn TEXT, context TEXT, classified INTEGER DEFAULT 0,
+            PRIMARY KEY(agent, session, turn));
+        CREATE INDEX IF NOT EXISTS prompt_context_session ON prompt_contexts(agent, session);
         CREATE TABLE IF NOT EXISTS outbox (
             id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT);
         CREATE TABLE IF NOT EXISTS git_identity (
@@ -743,6 +747,54 @@ def installed_version():
     return None
 
 
+def attribution_context(facts, cwd, classifier, salt):
+    worktree = facts.get("worktree")
+    if worktree:
+        branch = facts.get("branch")
+        location = [worktree, "branch" if branch else "detached", branch or facts.get("head")]
+    elif isinstance(cwd, str) and os.path.isabs(cwd):
+        location = ["directory", os.path.realpath(cwd)]
+    else:
+        return None
+    try:
+        contents = classifier.read_bytes()
+    except FileNotFoundError:
+        contents = b""
+        location.append("missing-classifier")
+    except OSError:
+        return None
+    digest = hashlib.sha256(salt + json.dumps(location).encode())
+    digest.update(contents)
+    return digest.hexdigest()
+
+
+def prompt_attribution(db, key, context, changes):
+    """Seed a turn once. Only compare with the last submitted prompt in this session."""
+    current = db.execute(
+        "SELECT classified FROM prompt_contexts WHERE agent=? AND session=? AND turn=?", key
+    ).fetchone()
+    if current:
+        if current[0]:
+            state = db.execute("SELECT state FROM turns WHERE agent=? AND session=? AND turn=?", key).fetchone()
+            return json.loads(state[0])["tags"]
+        return None
+
+    previous = db.execute(
+        "SELECT context, classified, state FROM prompt_contexts JOIN turns USING(agent, session, turn) "
+        "WHERE agent=? AND session=? ORDER BY prompt_contexts.rowid DESC LIMIT 1", key[:2]
+    ).fetchone()
+    inherited = None
+    existing = db.execute("SELECT state FROM turns WHERE agent=? AND session=? AND turn=?", key).fetchone()
+    if existing and json.loads(existing[0]).get("tags"):
+        inherited = json.loads(existing[0])["tags"]
+    elif context and previous and previous[0] == context and previous[1]:
+        state = json.loads(previous[2])
+        inherited = state["tags"]
+        changes.update(tags=inherited, tag_sources=state.get("tag_sources", {}))
+    db.execute("INSERT INTO prompt_contexts VALUES (?,?,?,?,?)", (*key, context, inherited is not None))
+    return inherited
+
+
 def handle(db, name, payload):
     global SOURCE
     agent = AGENTS[name]
@@ -788,6 +840,9 @@ def handle(db, name, payload):
     if observe:
         salt = db.execute("SELECT salt FROM install WHERE id=1").fetchone()[0]
         facts = git_facts(payload.get("cwd"), salt)
+    if turn and event == "UserPromptSubmit":
+        classifier = Path(os.environ.get("VANTAGE_CLASSIFIER_FILE", Path(home) / "vantage/classifier.md")).expanduser()
+        context = attribution_context(facts, payload.get("cwd"), classifier, salt)
     with write(db):
         db.execute(
             "INSERT OR IGNORE INTO sessions(agent,session,home) VALUES (?,?,?)",
@@ -810,6 +865,7 @@ def handle(db, name, payload):
                 changes["identity_observed_ns"] = now
             if event == "UserPromptSubmit":
                 changes["started_ns"] = now
+                inherited = prompt_attribution(db, key, context, changes)
             if event in ("Stop", "SessionEnd"):
                 changes["ended_ns"] = now
             if agent.child_owner_field and session != payload.get("session_id"):
@@ -849,18 +905,14 @@ def handle(db, name, payload):
                 turn,
             ]
         )
-        message = f"When PR, ticket, or purpose is known, use {command} --set name=value --source inferred for this turn."
-        classifier = Path(
-            os.environ.get(
-                "VANTAGE_CLASSIFIER_FILE", Path(home) / "vantage/classifier.md"
-            )
-        ).expanduser()
-        if classifier.is_file():
-            message = (
-                f"Read the Vantage classifier at {shlex.quote(str(classifier))}. "
-                f"Apply its dimensions to this turn with {command} --source inferred "
-                "--tag key=value (repeat for additional dimensions)."
-            )
+        rule = (f"read {shlex.quote(str(classifier))}" if classifier.is_file()
+                else "infer known PR, ticket, and purpose")
+        update = f"{command} --source inferred --replace [name=value ...] (omit unknown dimensions)"
+        if inherited is None:
+            message = f"For this turn, {rule} and submit the complete classification with {update}."
+        else:
+            message = (f"Current attribution: {json.dumps(inherited, ensure_ascii=True)}. "
+                       f"Only if the task or attribution changed, {rule} and run {update}.")
         print(
             json.dumps(
                 {
@@ -895,6 +947,7 @@ def main():
     )
     group = tag.add_mutually_exclusive_group(required=True)
     group.add_argument("--set", "--tag", action="append", metavar="NAME=VALUE")
+    group.add_argument("--replace", nargs="*", metavar="NAME=VALUE")
     group.add_argument("--clear", metavar="NAME")
     for action in ("recover", "flush", "status"):
         sub.add_parser(action).add_argument("--binding")
@@ -920,19 +973,20 @@ def main():
         if args.action == "tag":
             key = (args.agent, args.session, args.turn)
             tags = {}
-            for assignment in args.set or [args.clear]:
+            assignments = args.replace if args.replace is not None else args.set or [args.clear]
+            for assignment in assignments:
                 name, sep, value = assignment.partition("=")
                 if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", name):
                     parser.error("invalid classifier dimension name")
                 if args.clear and sep:
                     parser.error("--clear expects a dimension name")
-                if args.set and (
+                if args.clear is None and (
                     not sep
                     or not 1 <= len(value) <= 512
                     or any(ord(c) < 32 or ord(c) == 127 for c in value)
                 ):
                     parser.error("invalid classifier value")
-                tags[name] = value if args.set else None
+                tags[name] = None if args.clear else value
             with write(db):
                 row = db.execute(
                     "SELECT state FROM turns WHERE agent=? AND session=? AND turn=?",
@@ -940,9 +994,14 @@ def main():
                 ).fetchone()
                 if not row:
                     parser.error("unknown turn")
-                if args.set and len(set(json.loads(row[0])["tags"]) | tags.keys()) > 32:
+                previous = json.loads(row[0])["tags"]
+                final_names = set(previous) | tags.keys() if args.set else tags.keys()
+                if len(final_names) > 32:
                     parser.error("at most 32 dimensions per turn")
+                if args.replace is not None:
+                    tags.update({name: None for name in previous if name not in tags})
                 snapshot(db, key, tags=tags, tag_source=args.source)
+                db.execute("UPDATE prompt_contexts SET classified=1 WHERE agent=? AND session=? AND turn=?", key)
             launch(db, False, force=True)
         elif args.action == "status":
             for table in ("sessions", "turns", "outbox"):

@@ -43,7 +43,12 @@ Python 3.9+, and curl with HTTP/2 support.
 Each user prompt opens a turn snapshot. The hook captures Git and developer
 identity observations, model request fingerprints, and classifier tags. Setup
 installs the account classifier and refreshes its cached Markdown on session
-start. The generated tag command applies to the current turn.
+start. Within a session, a new turn inherits the previous prompt's classification
+when the worktree, branch, and classifier contents match. Ordinary commits on
+a branch preserve the classification. Detached checkouts use the commit, and
+outside Git the hook uses the working directory. A task change in the same
+checkout can override inherited tags with the turn-specific `--replace` command.
+An unchanged follow-up requires no classifier read or tag command from the agent.
 
 Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection

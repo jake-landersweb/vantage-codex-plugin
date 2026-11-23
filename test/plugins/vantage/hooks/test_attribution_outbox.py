@@ -1,3 +1,6 @@
+from contextlib import redirect_stdout
+import io
+import os
 import datetime
 import json
 import time
@@ -38,6 +41,56 @@ class HookTest(unittest.TestCase):
             json.loads(row[0])
             for row in self.db.execute("SELECT payload FROM outbox ORDER BY rowid")
         ]
+
+    def submit(self, turn, session="s", branch="feature", head="abc", worktree="work", cwd=None):
+        payload = {"session_id": session, "turn_id": turn, "hook_event_name": "UserPromptSubmit",
+                   "cwd": str(cwd or self.root), "cli_version": "test"}
+        classifier = self.root / "classifier.md"
+        facts = {"worktree": worktree, "branch": branch, "head": head} if worktree else {}
+        with patch.dict(os.environ, VANTAGE_CLASSIFIER_FILE=str(classifier)), patch.object(
+            store, "git_facts", return_value=facts
+        ), redirect_stdout(io.StringIO()) as output:
+            handle(self.db, "codex", payload)
+        return json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+
+    def tag(self, turn, *args):
+        with patch.object(store, "load_connection"), patch.object(
+            sys, "argv", ["hook", "tag", "codex", "s", turn, *args]
+        ):
+            store.main()
+
+    def test_reuse_survives_commit_and_retry_preserves_override(self):
+        self.submit("first")
+        self.tag("first", "--set", "pr=10", "--source", "explicit")
+        self.tag("first", "--set", "purpose=development", "--source", "inferred")
+        self.assertIn("Current attribution", self.submit("next", head="new"))
+        state = json.loads(self.payloads()[-1]["state"])
+        self.assertEqual(state["tags"], {"pr": "10", "purpose": "development"})
+        self.assertEqual(state["tag_sources"], {"pr": "explicit", "purpose": "inferred"})
+        self.tag("next", "--replace", "purpose=research")
+        self.assertIn('"purpose": "research"', self.submit("next"))
+        self.assertEqual(json.loads(self.payloads()[-1]["state"])["tags"], {"purpose": "research"})
+        self.tag("next", "--replace")
+        self.assertIn("Current attribution: {}", self.submit("third"))
+
+    def test_context_changes_and_unclassified_turns_require_classification(self):
+        classifier = self.root / "classifier.md"
+        classifier.write_text("v1")
+        for i, (options, reuse) in enumerate([
+            ({}, False), ({}, False),  # first turn wasn't classified
+            ({"branch": "other"}, False), ({"worktree": "other"}, False),
+            ({"branch": ""}, False), ({"branch": "", "head": "new"}, False),
+            ({"worktree": ""}, False), ({"worktree": ""}, True),
+            ({"worktree": "", "cwd": self.root / "other"}, False),
+            ({}, False), ({}, False), ({"session": "other"}, False),
+        ]):
+            with self.subTest(i=i, options=options):
+                if i == 10:
+                    classifier.write_text("v2")
+                turn = str(i)
+                self.assertEqual("Current attribution" in self.submit(turn, **options), reuse)
+                if i and "session" not in options:
+                    self.tag(turn, "--replace", "purpose=research")
 
     def test_grpc_ack_requires_success_trailer_and_full_batch(self):
         headers = (
