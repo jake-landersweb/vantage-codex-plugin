@@ -1,10 +1,14 @@
+import fcntl
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -159,6 +163,34 @@ class VantageMcpTest(unittest.TestCase):
             self.assertEqual(run.call_args.args[0][3:], [
                 "tag", "codex", "s", "t", "--source", "inferred", "--replace", *assignments,
             ])
+
+    def test_mcp_writes_only_an_existing_turn_in_the_configured_outbox(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, CODEX_HOME=tmp):
+            vantage = pathlib.Path(tmp) / "vantage"
+            endpoint, token = "http://127.0.0.1:1", "fixture-token"
+            binding = hashlib.sha256((endpoint + "\0" + token).encode()).hexdigest()
+            outbox = vantage / "outbox" / binding
+            outbox.mkdir(parents=True)
+            (vantage / "connection.json").write_text(json.dumps({
+                "endpoint": endpoint, "token": token, "since_ns": 1,
+            }))
+            # Keep the test offline while exercising the same hook and writer as the server.
+            with (outbox / "worker.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                subprocess.run([sys.executable, "-I", str(MODULE.PLUGIN_ROOT / "hooks/vantage_codex_hook.py")],
+                               input=json.dumps({"hook_event_name": "UserPromptSubmit",
+                                                 "session_id": "s", "turn_id": "t"}),
+                               capture_output=True, text=True, check=True)
+                for turn, tags, success in [("t", {"ticket": "DEMO-1"}, True),
+                                            ("missing", {}, False), ("t", {}, True)]:
+                    args = {"session_id": "s", "turn_id": turn, "tags": tags}
+                    result = MODULE.call_tool({"name": "set_turn_attribution", "arguments": args})
+                    self.assertEqual(result["isError"], not success)
+                    with sqlite3.connect(outbox / "state.sqlite") as db:
+                        rows = db.execute("SELECT state FROM turns").fetchall()
+                    self.assertEqual(len(rows), 1)
+                    if success:
+                        self.assertEqual(json.loads(rows[0][0])["tags"], tags)
 
     def test_set_turn_attribution_rejects_invalid_arguments_before_writing(self):
         valid = {"session_id": "s", "turn_id": "t", "tags": {}}
