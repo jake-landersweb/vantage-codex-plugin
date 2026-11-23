@@ -126,7 +126,7 @@ class VantageCodexHookTest(unittest.TestCase):
         )
 
         self.assertEqual(0, result.returncode)
-        self.assertIn("tag codex session-1 turn-1", result.stdout)
+        self.assertIn("set_turn_attribution with session_id=session-1, turn_id=turn-1", result.stdout)
         self.assertEqual("", result.stderr)
 
     def test_launcher_uses_the_newest_declared_plugin_version(self):
@@ -239,7 +239,7 @@ class VantageCodexHookTest(unittest.TestCase):
         )
 
         self.assertEqual(0, result.returncode)
-        self.assertIn("tag codex session-1 turn-1", result.stdout)
+        self.assertIn("set_turn_attribution with session_id=session-1, turn_id=turn-1", result.stdout)
         self.assertEqual("", result.stderr)
 
 

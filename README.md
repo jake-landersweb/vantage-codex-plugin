@@ -47,8 +47,8 @@ start. Within a session, a new turn inherits the previous prompt's classificatio
 when the worktree, branch, and classifier contents match. Ordinary commits on
 a branch preserve the classification. Detached checkouts use the commit, and
 outside Git the hook uses the working directory. A task change in the same
-checkout can override inherited tags with the turn-specific `--replace` command.
-An unchanged follow-up requires no classifier read or tag command from the agent.
+checkout can override inherited tags with the plugin’s `set_turn_attribution` MCP tool.
+An unchanged follow-up requires no classifier read or tool call from the agent.
 
 Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection

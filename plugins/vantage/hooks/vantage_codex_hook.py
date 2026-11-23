@@ -906,27 +906,16 @@ def handle(db, name, payload):
         if event in {"SessionStart", "Stop", "SessionEnd"}:
             schedule_recovery(db, "*" if event == "SessionStart" else session)
     if turn and event == "UserPromptSubmit":
-        command = shlex.join(
-            [
-                "env",
-                "CODEX_HOME=" + str(HOME),
-                sys.executable,
-                "-I",
-                str(HOME / "vantage/hooks/run_vantage_codex_hook.py"),
-                "tag",
-                name,
-                session,
-                turn,
-            ]
-        )
         rule = (f"read {shlex.quote(str(classifier))}" if classifier.is_file()
                 else "infer known PR, ticket, and purpose")
-        update = f"{command} --source inferred --replace [name=value ...] (omit unknown dimensions)"
+        update = (f"call the vantage_local MCP tool set_turn_attribution with "
+                  f"session_id={session}, turn_id={turn}, and tags containing the complete "
+                  "classification as a JSON object ({} clears all dimensions)")
         if inherited is None:
-            message = f"For this turn, {rule} and submit the complete classification with {update}."
+            message = f"For this turn, {rule} and {update}."
         else:
             message = (f"Current attribution: {json.dumps(inherited, ensure_ascii=True)}. "
-                       f"Only if the task or attribution changed, {rule} and run {update}.")
+                       f"Only if the task or attribution changed, {rule} and {update}.")
         print(
             json.dumps(
                 {

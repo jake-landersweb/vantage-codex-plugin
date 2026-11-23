@@ -3,6 +3,7 @@
 
 import json
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -314,7 +315,50 @@ def tool_definitions():
                 "openWorldHint": False,
             },
         },
+        {
+            "name": "set_turn_attribution",
+            "description": "Replace the classifier tags for the Codex turn identified by the Vantage hook.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "turn_id": {"type": "string"},
+                    "tags": {"type": "object", "additionalProperties": {"type": "string"}, "maxProperties": 32},
+                },
+                "required": ["session_id", "turn_id", "tags"],
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+        },
     ]
+
+
+def set_turn_attribution(arguments):
+    if set(arguments) != {"session_id", "turn_id", "tags"}:
+        raise ValueError("expected session_id, turn_id, and tags")
+    ids = [arguments["session_id"], arguments["turn_id"]]
+    if not all(isinstance(i, str) and re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.:/-]{0,179}", i) for i in ids):
+        raise ValueError("invalid session or turn identifier")
+    tags = arguments["tags"]
+    if not isinstance(tags, dict) or len(tags) > 32:
+        raise ValueError("tags must be an object with at most 32 dimensions")
+    assignments = []
+    for key, value in tags.items():
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", key) or not isinstance(value, str):
+            raise ValueError("invalid classifier dimension")
+        if not 1 <= len(value) <= 512 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("invalid classifier value")
+        assignments.append(f"{key}={value}")
+    # Use the bundled writer so validation, replacement and delivery share the CLI transaction.
+    command = [sys.executable, "-I", str(PLUGIN_ROOT / "hooks/vantage_codex_hook.py"),
+               "tag", "codex", *ids, "--source", "inferred", "--replace", *assignments]
+    try:
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        saved = completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        saved = False
+    message = "Turn attribution saved." if saved else "Could not save attribution. Check the turn reference and local telemetry setup."
+    return {"content": [{"type": "text", "text": message}], "isError": not saved}
 
 
 def call_tool(params, runner=run_tool_action):
@@ -324,6 +368,8 @@ def call_tool(params, runner=run_tool_action):
     arguments = params.get("arguments", {})
     if not isinstance(arguments, dict):
         raise ValueError("tool arguments must be an object")
+    if name == "set_turn_attribution":
+        return set_turn_attribution(arguments)
     actions = {
         "connect_vantage_telemetry": "start",
         "check_vantage_telemetry_setup": "status",

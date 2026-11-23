@@ -141,12 +141,33 @@ class VantageMcpTest(unittest.TestCase):
                 "connect_vantage_telemetry",
                 "check_vantage_telemetry_setup",
                 "remove_vantage_telemetry",
+                "set_turn_attribution",
             ],
             [tool["name"] for tool in tools],
         )
         self.assertFalse(tools[0]["annotations"]["readOnlyHint"])
         self.assertTrue(tools[1]["annotations"]["readOnlyHint"])
         self.assertTrue(tools[2]["annotations"]["destructiveHint"])
+
+    def test_set_turn_attribution_replaces_and_clears_tags(self):
+        for tags, assignments in [({"ticket": "DEMO-1"}, ["ticket=DEMO-1"]), ({}, [])]:
+            with mock.patch.object(subprocess, "run", return_value=FakeProcess()) as run:
+                result = MODULE.call_tool({"name": "set_turn_attribution", "arguments": {
+                    "session_id": "s", "turn_id": "t", "tags": tags,
+                }})
+            self.assertFalse(result["isError"])
+            self.assertEqual(run.call_args.args[0][3:], [
+                "tag", "codex", "s", "t", "--source", "inferred", "--replace", *assignments,
+            ])
+
+    def test_set_turn_attribution_rejects_invalid_arguments_before_writing(self):
+        valid = {"session_id": "s", "turn_id": "t", "tags": {}}
+        for invalid in [{"session_id": "--help"}, {"tags": {"x=y": "a"}}, {"tags": {"x": 2}},
+                        {"tags": {"x": "two\nlines"}}, {"binding": "another"}]:
+            with self.subTest(invalid=invalid), mock.patch.object(subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    MODULE.set_turn_attribution(dict(valid, **invalid))
+                run.assert_not_called()
 
     def test_connect_tool_returns_only_sanitized_output(self):
         secret = "vntg_ti_PRIVATE_CREDENTIAL"
