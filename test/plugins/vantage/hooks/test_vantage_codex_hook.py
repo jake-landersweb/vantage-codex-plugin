@@ -58,13 +58,13 @@ class VantageCodexHookTest(unittest.TestCase):
         opener.open.return_value = response
         env = {
             "CODEX_HOME": str(codex_home),
-            "VANTAGE_CLASSIFIER_ENDPOINT": "https://api.vantage.sh/plugins/realtime_ai_classifier",
         }
 
         with mock.patch.object(HOOK.urllib.request, "build_opener", return_value=opener):
             self.assertTrue(HOOK.refresh_classifier(env, stderr=io.StringIO()))
 
         request = opener.open.call_args.args[0]
+        self.assertEqual("https://api.staging.vantage.sh/plugins/classifier", request.full_url)
         self.assertEqual(
             HOOK.CLASSIFIER_TIMEOUT,
             opener.open.call_args.kwargs["timeout"],
