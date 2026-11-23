@@ -1,5 +1,6 @@
 import datetime
 import json
+import time
 import sys
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ sys.path.insert(
 )
 import pilot_attribution as store
 
+launch = store.launch
 handle, recover, drain = store.handle, store.recover, store.drain
 
 
@@ -137,6 +139,19 @@ class HookTest(unittest.TestCase):
             drain(self.db)
         self.assertEqual(self.payloads(), events)
 
+    def test_long_git_history_keeps_first_latest_and_tag_revision(self):
+        key = ("codex", "s", "t")
+        for i in range(160):
+            store.snapshot(self.db, key, facts={"head": str(i), "branch": "feature-" + "a"*450})
+        store.snapshot(self.db, key, tags={"ticket":"PLA-123"})
+        encoded = self.payloads()[-1]["state"]
+        self.assertLessEqual(len(encoded.encode()), 65536)
+        state = json.loads(encoded)
+        self.assertEqual(state["git"][0]["facts"]["head"], "0")
+        self.assertEqual(state["git"][-1]["facts"]["head"], "159")
+        self.assertGreater(state["omitted_git_observations"], 0)
+        self.assertEqual(state["tags"]["ticket"], "PLA-123")
+
     def test_recover_unregistered_post_install_session(self):
         when = datetime.datetime.now(datetime.timezone.utc)
         ms = int(when.timestamp() * 1000)
@@ -150,6 +165,64 @@ class HookTest(unittest.TestCase):
             recover(self.db)
             recover(self.db)
         self.assertEqual([event["event.name"] for event in self.payloads()], [store.TURN, store.REQUEST])
+
+    def test_recovery_isolates_unreadable_file_and_keeps_cursor(self):
+        folder = self.root / "sessions"
+        folder.mkdir()
+        sessions = [str(uuid.uuid4()) for _ in range(2)]
+        paths = []
+        for session in sessions:
+            self.db.execute("INSERT INTO sessions VALUES ('codex',?,?,0)", (session, str(self.root)))
+            path = folder / f"rollout-{session}.jsonl"
+            paths.append(path)
+            record = {"timestamp": "2026-01-01T00:00:00Z", "type": "token_usage_record",
+                      "payload": {"thread_id": session, "turn_id": "t", "usage": {"input_tokens": 8}}}
+            path.write_text(json.dumps(record) + "\n")
+        original_open = Path.open
+        def selective_open(path, *args, **kwargs):
+            if path == paths[0]:
+                raise PermissionError()
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, "open", selective_open):
+            recover(self.db)
+        self.assertEqual({e["session.id"] for e in self.payloads()}, {sessions[1]})
+        self.assertEqual(self.db.execute("SELECT offset FROM sessions WHERE session=?", (sessions[0],)).fetchone()[0], 0)
+        recover(self.db)
+        self.assertEqual(len(self.payloads()), 4)
+
+    def test_resume_refreshes_version_without_rewriting_historical_requests(self):
+        payload = {"session_id": "session", "hook_event_name": "SessionStart"}
+        with patch.object(store, "installed_version", side_effect=["1.0", "2.0"]) as lookup:
+            handle(self.db, "codex", payload)
+            handle(self.db, "codex", dict(payload, hook_event_name="PostModelRequest", turn_id="a"))
+            original_time = time.time_ns()
+            handle(self.db, "codex", payload)
+            handle(self.db, "codex", dict(payload, hook_event_name="PostModelRequest", turn_id="b"))
+            store.correlation(self.db, ("codex", "session", "a"), {}, "rollout",
+                              status="completed", timestamp=original_time)
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual([e["agent.version"] for e in self.payloads() if e["event.name"] == store.REQUEST],
+                         ["1.0", "2.0", "1.0"])
+
+    def test_busy_sender_coalesces_kicks_and_retries_same_id(self):
+        key = ("codex", "s", "t")
+        store.enqueue(self.db, store.REQUEST, key, {"status":"completed"})
+        initial = self.payloads()
+        with (store.STATE / "worker.lock").open("a") as lock:
+            store.fcntl.flock(lock, store.fcntl.LOCK_EX)
+            with patch.object(store.subprocess, "Popen") as spawn:
+                for _ in range(20):
+                    launch(self.db, True)
+                spawn.assert_not_called()
+            self.assertEqual(self.db.execute("SELECT count(*) FROM recovery_queue").fetchone()[0], 1)
+            with patch.object(store, "recover") as scan, patch.object(store, "export", side_effect=RuntimeError):
+                store.run_sender(self.db, lock)
+                scan.assert_called_once()
+        self.assertEqual(initial, self.payloads())
+        with patch.object(store, "export") as send:
+            launch(self.db, foreground=True, force=True)
+        self.assertEqual(send.call_args.args[1][0][1]["event_id"], initial[0]["event_id"])
+        self.assertFalse(self.payloads())
 
     def test_recovery_handles_partial_lines_parent_history_and_retries(self):
         session = str(uuid.uuid4())

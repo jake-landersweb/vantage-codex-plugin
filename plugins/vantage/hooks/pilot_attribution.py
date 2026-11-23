@@ -13,6 +13,7 @@ import json
 import os
 from functools import lru_cache
 import re
+import random
 import platform
 import shlex
 import sqlite3
@@ -177,7 +178,13 @@ def connect():
             PRIMARY KEY(agent, session));
         CREATE TABLE IF NOT EXISTS turn_models (agent TEXT, session TEXT, turn TEXT, model TEXT,
             PRIMARY KEY(agent, session, turn, model));
-        CREATE TABLE IF NOT EXISTS worker_clock (id INTEGER PRIMARY KEY, last_kick REAL);
+        CREATE TABLE IF NOT EXISTS sender (id INTEGER PRIMARY KEY, failures INTEGER DEFAULT 0,
+            retry_at REAL DEFAULT 0, last_ack REAL DEFAULT 0, discovered REAL DEFAULT 0);
+        INSERT OR IGNORE INTO sender(id) VALUES(1);
+        CREATE TABLE IF NOT EXISTS recovery_queue (session TEXT PRIMARY KEY, generation INTEGER);
+        CREATE TABLE IF NOT EXISTS rollout_paths (session TEXT PRIMARY KEY, path TEXT);
+        CREATE TABLE IF NOT EXISTS versions_at (agent TEXT, session TEXT, at_ns INTEGER, version TEXT,
+            PRIMARY KEY(agent,session,at_ns));
     """)
     return db
 
@@ -213,7 +220,8 @@ def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
     event_id = event_id or str(uuid.uuid4())
     timestamp = timestamp if timestamp is not None else time.time_ns()
     email = observed_email(db, key, timestamp)
-    version = db.execute("SELECT version FROM cli_versions WHERE agent=? AND session=?", key[:2]).fetchone()
+    version = db.execute("SELECT version FROM versions_at WHERE agent=? AND session=? AND at_ns<=? "
+                         "ORDER BY at_ns DESC LIMIT 1", (*key[:2], timestamp)).fetchone()
     models = [row[0] for row in db.execute("SELECT model FROM turn_models WHERE agent=? AND session=? AND turn=?", key)]
     turn_model = models[0] if len(models) == 1 else "multiple" if models else "unknown"
     summary = kind == TURN
@@ -269,6 +277,10 @@ def snapshot(
             state["tags"][name] = value
             state.setdefault("tag_sources", {})[name] = tag_source
     encoded = json.dumps(state, sort_keys=True)
+    while len(encoded.encode()) > 64 * 1024 and len(state["git"]) > 2:
+        del state["git"][1]
+        state["omitted_git_observations"] = state.get("omitted_git_observations", 0) + 1
+        encoded = json.dumps(state, sort_keys=True)
     if row and previous == encoded:
         return
     db.execute(
@@ -306,7 +318,9 @@ def project(db, session, offset, line):
         meta = entry.get("payload", {})
         version = identifier(meta.get("cli_version"))
         if version and meta.get("id") == session:
-            db.execute("INSERT OR REPLACE INTO cli_versions VALUES ('codex',?,?)", (session, version))
+            when = datetime.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+            db.execute("INSERT OR REPLACE INTO versions_at VALUES ('codex',?,?,?)",
+                       (session, int(when.timestamp() * 1e9), version))
         return
     if entry.get("type") != "token_usage_record":
         return
@@ -339,30 +353,34 @@ def project(db, session, offset, line):
     )
 
 
-def recover(db):
-    sessions = db.execute(
-        "SELECT session,home,offset FROM sessions WHERE agent='codex'"
-    ).fetchall()
+def recover(db, targets=None, *, after_chunk=None):
+    sessions = db.execute("SELECT session,home,offset FROM sessions WHERE agent='codex'")
     by_home = {str(HOME): {}} if OPT_IN else {}
     for session, home, offset in sessions:
         by_home.setdefault(home, {})[session] = offset
     for home, offsets in by_home.items():
-        for directory in ("sessions", "archived_sessions"):
-            for path in (Path(home) / directory).rglob("*.jsonl"):
-                # Codex file names end with the 36-character owning thread UUID.
-                session = path.stem[-36:]
-                if session not in offsets:
-                    # Dedicated pilot home: only discover threads created after opt-in.
-                    # A UUIDv7 timestamp is independent of file copy or archive times.
-                    try:
-                        thread = uuid.UUID(session)
-                    except ValueError:
-                        continue
-                    if not OPT_IN or thread.version != 7 or (thread.int >> 80) * 1_000_000 < OPT_IN:
-                        continue
-                    db.execute("INSERT OR IGNORE INTO sessions(agent,session,home) VALUES ('codex',?,?)", (session, home))
-                    offsets[session] = 0
-                offset = offsets[session]
+        if targets is None:
+            paths = (path for directory in ("sessions", "archived_sessions")
+                     for path in (Path(home) / directory).rglob("*.jsonl"))
+        else:
+            paths = [Path(row[0]) for session in targets if session in offsets
+                     for row in db.execute("SELECT path FROM rollout_paths WHERE session=?", (session,))]
+        for path in paths:
+            # Codex file names end with the 36-character owning thread UUID.
+            session = path.stem[-36:]
+            if session not in offsets:
+                # Dedicated pilot home: only discover threads created after opt-in.
+                # A UUIDv7 timestamp is independent of file copy or archive times.
+                try:
+                    thread = uuid.UUID(session)
+                except ValueError:
+                    continue
+                if not OPT_IN or thread.version != 7 or (thread.int >> 80) * 1_000_000 < OPT_IN:
+                    continue
+                db.execute("INSERT OR IGNORE INTO sessions(agent,session,home) VALUES ('codex',?,?)", (session, home))
+                offsets[session] = 0
+            offset = offsets[session]
+            try:
                 with path.open("rb") as stream:
                     stream.seek(offset if path.stat().st_size >= offset else 0)
                     while True:
@@ -396,6 +414,13 @@ def recover(db):
                                 (stream.tell(), session),
                             )
                         offsets[session] = stream.tell()
+                        if after_chunk:
+                            after_chunk(db)
+            except OSError:
+                db.execute("INSERT INTO diagnostics VALUES ('rollout_io_errors',1) "
+                           "ON CONFLICT(name) DO UPDATE SET count=count+1")
+                continue
+            db.execute("INSERT OR REPLACE INTO rollout_paths VALUES (?,?)", (session, str(path)))
 
 
 # The sender only produces OTLP logs with scalar attributes. curl owns the
@@ -505,46 +530,94 @@ def export(service, records, *, token=None):
         require_ack(headers.read(), reply.stdout)
 
 
-def drain(db):
+def drain(db, *, single=False):
     while rows := db.execute(
         "SELECT id,timestamp,payload FROM outbox ORDER BY rowid LIMIT 64"
     ).fetchall():
         export("vantage-agent-hook", [(ts, json.loads(data)) for _, ts, data in rows])
         with write(db):
             db.executemany("DELETE FROM outbox WHERE id=?", [(row[0],) for row in rows])
-
-
-def worker(db, recover_files):
-    with (STATE / "worker.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # Deliver hook evidence even if a registered file is unreadable.
-        try:
-            if recover_files:
-                recover(db)
-        finally:
-            drain(db)
-
-
-def launch(db, recover_files, *, force=False):
-    with write(db):
-        row = db.execute("SELECT last_kick FROM worker_clock WHERE id=1").fetchone()
-        if not (recover_files or force) and row and time.time() - row[0] < 60:
+            db.execute("UPDATE sender SET failures=0,retry_at=0,last_ack=? WHERE id=1", (time.time(),))
+        if single:
             return
-        db.execute("INSERT OR REPLACE INTO worker_clock VALUES (1,?)", (time.time(),))
-    # Children inherit the sender profile. Close agent pipes so shutdown can complete.
-    subprocess.Popen(
-        [
-            sys.executable,
-            "-I",
-            str(Path(__file__).resolve()),
-            "recover" if recover_files else "flush",
-            "--binding", STATE.name,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+
+
+def schedule_recovery(db, session):
+    db.execute("INSERT INTO recovery_queue VALUES (?,1) ON CONFLICT(session) "
+               "DO UPDATE SET generation=generation+1", (session,))
+
+
+def send_batch_if_due(db):
+    failures, retry_at = db.execute("SELECT failures,retry_at FROM sender WHERE id=1").fetchone()
+    if retry_at > time.time():
+        return
+    try:
+        drain(db, single=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        delay = min(300, 5 * 2 ** min(failures, 6) * random.uniform(0.8, 1.2))
+        db.execute("UPDATE sender SET failures=failures+1,retry_at=? WHERE id=1",
+                   (time.time() + delay,))
+
+
+def run_sender(db, lock):
+    while True:
+        requests = db.execute("SELECT session,generation FROM recovery_queue").fetchall()
+        send_batch_if_due(db)
+        if requests:
+            targets = {session for session, _ in requests}
+            missing_path = db.execute("SELECT 1 FROM recovery_queue q LEFT JOIN rollout_paths p "
+                                      "USING(session) WHERE p.path IS NULL LIMIT 1").fetchone()
+            discovered = db.execute("SELECT discovered FROM sender").fetchone()[0]
+            discover = bool(missing_path) or time.time() - discovered >= 300
+            recover(db, None if discover else targets, after_chunk=send_batch_if_due)
+            with write(db):
+                if discover:
+                    db.execute("UPDATE sender SET discovered=? WHERE id=1", (time.time(),))
+                db.executemany("DELETE FROM recovery_queue WHERE session=? AND generation=?", requests)
+        # Serialize the idle decision with hook writes. A writer that commits
+        # after this check will find the lock available when it kicks the sender.
+        with write(db):
+            pending = db.execute("SELECT EXISTS(SELECT 1 FROM recovery_queue) OR "
+                                 "(retry_at<=? AND EXISTS(SELECT 1 FROM outbox)) FROM sender",
+                                 (time.time(),)).fetchone()[0]
+            if not pending:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                return
+
+
+def launch(db, recover_files=False, *, foreground=False, force=False):
+    if recover_files:
+        schedule_recovery(db, "*")
+    if force and foreground:
+        db.execute("UPDATE sender SET retry_at=0 WHERE id=1")
+    runnable = db.execute("SELECT EXISTS(SELECT 1 FROM recovery_queue) OR "
+                          "(retry_at<=? AND EXISTS(SELECT 1 FROM outbox)) FROM sender",
+                          (time.time(),)).fetchone()[0]
+    if not runnable:
+        return
+    with (STATE / "worker.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if foreground:
+            run_sender(db, lock)
+            return
+        subprocess.Popen(
+            [sys.executable, "-I", str(Path(__file__).resolve()), "send",
+             "--binding", STATE.name, "--lock-fd", str(lock.fileno())],
+            pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def installed_version():
+    try:
+        result = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            return identifier(result.stdout.strip().removeprefix("codex-cli "))
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 def handle(db, name, payload):
@@ -558,6 +631,9 @@ def handle(db, name, payload):
     SOURCE = event
     model = identifier(payload.get("model"))
     version = identifier(payload.get("cli_version") or payload.get("agent_version"))
+    if not version and name == "codex" and (event == "SessionStart" or not db.execute(
+        "SELECT 1 FROM cli_versions WHERE agent=? AND session=?", (name, session)).fetchone()):
+        version = installed_version() or "unknown"
     key = (name, session, turn)
     now = time.time_ns()
     home = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())
@@ -593,6 +669,7 @@ def handle(db, name, payload):
             (name, session, home),
         )
         if version:
+            db.execute("INSERT OR REPLACE INTO versions_at VALUES (?,?,?,?)", (name, session, now, version))
             db.execute("INSERT OR REPLACE INTO cli_versions VALUES (?,?,?)", (name, session, version))
         if turn:
             changes = {"first_seen_ns": now, "first_source": event}
@@ -631,6 +708,8 @@ def handle(db, name, payload):
                     status=payload.get("status", "unknown"),
                     model=identifier(payload.get("model")),
                 )
+        if event in {"SessionStart", "Stop", "SessionEnd"}:
+            schedule_recovery(db, "*" if event == "SessionStart" else session)
     if turn and event == "UserPromptSubmit":
         command = shlex.join(
             [
@@ -667,10 +746,7 @@ def handle(db, name, payload):
                 }
             )
         )
-    if event in {"SessionStart", "Stop", "SessionEnd"}:
-        launch(db, True)
-    elif event == "PostModelRequest":
-        launch(db, False)
+    launch(db)
 
 
 def main():
@@ -692,6 +768,9 @@ def main():
     group.add_argument("--clear", metavar="NAME")
     for action in ("recover", "flush", "status"):
         sub.add_parser(action).add_argument("--binding")
+    sender = sub.add_parser("send")
+    sender.add_argument("--lock-fd", type=int, required=True)
+    sender.add_argument("--binding", required=True)
     args = parser.parse_args(sys.argv[1:] or ["hook", "codex"])
     if getattr(args, "binding", None) and args.binding != STATE.name:
         return
@@ -738,11 +817,20 @@ def main():
         elif args.action == "status":
             for table in ("sessions", "turns", "outbox"):
                 print(table, db.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            failures, retry_at, last_ack = db.execute("SELECT failures,retry_at,last_ack FROM sender").fetchone()
+            print("consecutive_send_failures", failures)
+            print("retry_in_seconds", max(0, round(retry_at-time.time())))
+            print("last_ack_unix_seconds", int(last_ack))
+            print("pending_recoveries", db.execute("SELECT count(*) FROM recovery_queue").fetchone()[0])
             for name, count in db.execute("SELECT name,count FROM diagnostics"):
                 print(name, count)
         else:
             SOURCE = "rollout"
-            worker(db, args.action == "recover")
+            if args.action == "send":
+                with os.fdopen(args.lock_fd, "a") as lock:
+                    run_sender(db, lock)
+            else:
+                launch(db, args.action == "recover", foreground=True, force=True)
     finally:
         db.close()
 

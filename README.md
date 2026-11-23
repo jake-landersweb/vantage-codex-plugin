@@ -102,3 +102,22 @@ python3 plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage
 
 Removal deletes the managed hooks, exporter and credential. SQLite history
 remains local. Use a separate home per staging integration.
+
+### Measuring the pilot outbox on your machine
+
+Run the `status` command above before a workload, while several agents are
+active, and again after Stop. Record the time along with `outbox`,
+`pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,
+`retry_in_seconds`, and the cumulative `rollout_io_errors` (absent means zero).
+The outbox counts unacknowledged events. A backlog that grows across turns
+while acknowledgements advance indicates the sender is falling behind.
+A stalled acknowledgement with increasing failures indicates a delivery
+problem. Record the readings before using manual recovery, which retries
+immediately. SQLite file size also includes retained session state.
+
+Hooks share one short-lived sender per credential. It sends up to 64 rows at
+a time, coalesces recovery requests, and releases ownership when idle. Failed
+exports keep their event IDs and set a bounded retry delay. A later hook or
+manual recovery wakes the sender. No periodic process runs while Codex is idle.
+On session start or resume the pilot refreshes the installed CLI version if
+the hook payload omits it. Rollout recovery uses timestamped observations.
