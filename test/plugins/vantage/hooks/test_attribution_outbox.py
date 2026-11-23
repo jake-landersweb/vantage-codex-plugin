@@ -13,7 +13,7 @@ sys.path.insert(
     0,
     str(Path(__file__).resolve().parents[4] / "plugins/vantage/hooks"),
 )
-import pilot_attribution as store
+import vantage_codex_hook as store
 
 launch = store.launch
 handle, recover, drain = store.handle, store.recover, store.drain

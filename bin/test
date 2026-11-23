@@ -7,6 +7,4 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python3 "$repository_root/test/plugins/vantage/hooks/test_vantage_codex_hook.py"
 python3 "$repository_root/test/plugins/vantage/server/test_vantage_mcp.py"
 python3 "$repository_root/test/plugins/vantage/skills/test_configure_vantage_telemetry.py"
-if [ "$(uname -s)" != "Windows_NT" ]; then
-  python3 "$repository_root/test/plugins/vantage/hooks/test_pilot_attribution.py"
-fi
+python3 "$repository_root/test/plugins/vantage/hooks/test_attribution_outbox.py"

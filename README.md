@@ -24,86 +24,41 @@ Start a new Codex session after installation so Codex reloads the plugin.
 
 After editing the plugin, run `./bin/install-local` again to refresh the installed copy.
 
-## Install from GitHub
+## Connect Codex
 
-Vantage developers with access to the private repository can install the published
-marketplace directly:
+In Codex, ask **“Set up Vantage telemetry.”** Complete the browser sign-in,
+trust the Vantage hooks in Settings > Hooks, and restart Codex. Setup uses
+the normal Codex home (`~/.codex`, or your existing `CODEX_HOME`) and merges
+the handlers into `hooks.json`. The stable launcher resolves the installed
+plugin hook. To disconnect, ask Codex to remove Vantage telemetry.
 
-```sh
-codex plugin marketplace add vantage-sh/vantage-codex-plugin
-codex plugin add vantage@vantage-codex-plugin
-```
+The current pre-release ingest destination is **ingest-staging.vantage.sh**.
+Setup writes the native OTLP logs exporter and the attribution sender's
+connection from the same endpoint and credential. The sender uses verified
+TLS and OTLP/gRPC. Its current implementation requires macOS or Linux,
+Python 3.9+, and curl with HTTP/2 support.
 
-Use the checkout-based installation above while actively developing the plugin.
+## What gets recorded
 
-## Layout
+Each user prompt opens a turn snapshot. The hook captures Git and developer
+identity observations, model request fingerprints, and classifier tags. Setup
+installs the account classifier and refreshes its cached Markdown on session
+start. The generated tag command applies to the current turn.
 
-- `.agents/plugins/marketplace.json` declares the local marketplace.
-- `plugins/vantage/plugin.json` declares the Vantage plugin.
-- `plugins/vantage/skills` contains telemetry setup and session attribution skills.
-- `plugins/vantage/server` contains the local MCP tools used to connect or remove telemetry.
-- `plugins/vantage/hooks` contains the local Codex hook and launcher.
-- `test/plugins/vantage` contains the standalone Python tests.
+Hooks commit evidence to a private SQLite outbox under
+`${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection
+retries delivery. Session and turn lifecycle events trigger incremental
+recovery from Codex rollouts, including eligible threads created after setup
+whose hooks never fired. Billing continues to use native usage.
 
-The Vantage API endpoints used by setup and ingestion remain in Vantage Core. This
-repository contains only code that is installed and executed on a Codex user's machine.
+## Measuring the outbox
 
-Telemetry setup merges Vantage's `SessionStart` and `Stop` handlers into the user's
-`~/.codex/hooks.json` and installs a stable launcher in `~/.codex/vantage/hooks`.
-On every run, the launcher reads each installed Vantage plugin's declared `version`
-from `plugin.json` and executes the newest plugin-owned Python hook in the same isolated
-Python process. If no valid hook is installed, it exits successfully without doing
-anything. Unrelated user hooks, telemetry configuration, and credentials are preserved.
-Setup also stores a read-only classifier credential and the current classifier Markdown
-under `~/.codex/vantage` with user-only permissions. At each `SessionStart`, the hook
-uses an ETag conditional request to refresh the Markdown and falls back to the last
-valid copy when Vantage is unavailable. The attribution skill reads that file instead
-of embedding classifier values. Vantage scopes the Markdown to the customer's account,
-so its real-time AI sources share one classifier. Classifiers may define custom tag
-dimensions; hooks send them under the `vantage.classification.*` namespace without
-interpreting their meaning. Removing Vantage telemetry removes
-the managed hooks, launcher, classifier credential, and cached classifier.
-
-### Opt-in Codex staging attribution pilot (macOS or Linux)
-
-Use a dedicated Codex home for the staging integration. The installer prompts
-locally for its Codex ingest token and checks an empty authenticated OTLP/gRPC
-export over verified TLS. It requires Python 3.9+ and curl built with HTTP/2.
-Run these commands from the plugin checkout:
+From the same Codex home, inspect queued evidence or request recovery:
 
 ```sh
-export CODEX_HOME="$HOME/.codex-vantage-staging"
-./bin/install-local
-python3 plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py --staging
-codex
+python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" status
+python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" recover
 ```
-
-Trust the hooks in Codex, restart it, then use a multi-turn conversation.
-If the account supplies a classifier, place its Markdown at
-`$CODEX_HOME/vantage/classifier.md`. Each prompt gets a command scoped to
-its turn. A later tag or Git observation writes a new complete snapshot.
-
-Native usage goes through the configured Codex exporter. Hooks synchronously
-write turn state and request fingerprints to a private SQLite outbox under
-`$CODEX_HOME/vantage/outbox`. A detached worker sends batches to the same
-staging integration using gRPC and removes them on acknowledgement. Stop,
-SessionStart and SessionEnd trigger recovery from local Codex rollouts,
-including eligible post-install UUIDv7 threads without a registered hook.
-Recovery needs a local rollout and a later trigger. Request rows carry token
-fingerprints for correlation. Billing continues to use native usage.
-
-From the same home, inspect pending counts, retry, or remove the pilot:
-
-```sh
-python3 -I "$CODEX_HOME/vantage/hooks/run_vantage_codex_hook.py" status
-python3 -I "$CODEX_HOME/vantage/hooks/run_vantage_codex_hook.py" recover
-python3 plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py --remove
-```
-
-Removal deletes the managed hooks, exporter and credential. SQLite history
-remains local. Use a separate home per staging integration.
-
-### Measuring the pilot outbox on your machine
 
 Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
@@ -119,5 +74,5 @@ Hooks share one short-lived sender per credential. It sends up to 64 rows at
 a time, coalesces recovery requests, and releases ownership when idle. Failed
 exports keep their event IDs and set a bounded retry delay. A later hook or
 manual recovery wakes the sender. No periodic process runs while Codex is idle.
-On session start or resume the pilot refreshes the installed CLI version if
+On session start or resume the hook refreshes the installed CLI version if
 the hook payload omits it. Rollout recovery uses timestamped observations.

@@ -38,25 +38,27 @@ class Response:
 
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
-    def test_staging_lifecycle(self):
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CODEX_HOME": home}):
-            path = pathlib.Path(home)
-            hooks = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-hook"}]}]}}
-            MODULE.write_user_hooks(hooks)
-            with mock.patch("runpy.run_path", return_value={"export": mock.Mock()}), mock.patch("getpass.getpass", return_value="fake-staging"), mock.patch.object(sys, "argv", ["setup", "--staging"]):
+    def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME":home, "CODEX_HOME":""}), mock.patch.object(sys, "argv", ["setup"]):
+            with mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
+                MODULE, "wait_for_setup_credentials", return_value=self.setup_credentials()
+            ), mock.patch.object(MODULE, "verify_ingest_token"):
                 self.assertEqual(MODULE.main(), 0)
-                first = MODULE.pilot_profile().read_bytes()
-                self.assertEqual(MODULE.main(), 0)
-                self.assertEqual(MODULE.pilot_profile().read_bytes(), first)
-                self.assertIn(MODULE.STAGING, (path / "config.toml").read_text())
-                events = MODULE.load_user_hooks()["hooks"]
-                self.assertEqual(set(events), set(MODULE.PILOT_EVENTS))
-                self.assertEqual(len(events["Stop"]), 2)
+            root = pathlib.Path(home) / ".codex"
+            config = (root / "config.toml").read_text()
+            connection = root / "vantage/connection.json"
+            settings = json.loads(connection.read_text())
+            self.assertEqual("https://ingest-staging.vantage.sh", settings["endpoint"])
+            self.assertIn(settings["endpoint"] + "/v1/logs", config)
+            self.assertIn("Bearer " + settings["token"], config)
+            self.assertEqual(0o600, connection.stat().st_mode & 0o777)
+            self.assertEqual(MODULE.main(), 0)
+            self.assertEqual(settings, json.loads(connection.read_text()))
+            self.assertEqual(set(MODULE.HOOK_EVENTS), set(MODULE.load_user_hooks()["hooks"]))
             with mock.patch.object(sys, "argv", ["setup", "--remove"]):
                 self.assertEqual(MODULE.main(), 0)
-            self.assertEqual(MODULE.load_user_hooks(), hooks)
-            self.assertFalse(MODULE.pilot_profile().exists())
-            self.assertNotIn(MODULE.STAGING, (path / "config.toml").read_text())
+            self.assertFalse(connection.exists())
+            self.assertNotIn("exporter =", (root / "config.toml").read_text())
 
     def setup_payload(self, ingest_token="secret-token"):
         return {
@@ -174,7 +176,9 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             "urlopen",
             return_value=Response(200, {}),
         ) as urlopen:
-            MODULE.verify_ingest_token("secret-token")
+            with mock.patch.object(MODULE, "verify_attribution_transport") as grpc:
+                MODULE.verify_ingest_token("secret-token")
+                grpc.assert_called_once_with("secret-token")
 
         request = urlopen.call_args.args[0]
         self.assertEqual(MODULE.USER_AGENT, request.get_header("User-agent"))
@@ -278,7 +282,7 @@ log_user_prompt = true
 log_agent_responses = true
 log_guardian_assessments = true
 tool_result = { max_bytes = 1048576 }
-exporter = { otlp-http = { endpoint = "https://ingest.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
+exporter = { otlp-http = { endpoint = "https://ingest-staging.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
 trace_exporter = "none"
 """
 
@@ -364,9 +368,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     (installed / name).write_bytes(b"stale hook script")
                 MODULE.install_user_hooks()
                 payload = json.loads(hooks_path.read_text(encoding="utf-8"))
-                self.assertEqual(existing["hooks"]["PostToolUse"], payload["hooks"]["PostToolUse"])
+                self.assertEqual(existing["hooks"]["PostToolUse"], payload["hooks"]["PostToolUse"][:1])
                 self.assertEqual("echo start", payload["hooks"]["SessionStart"][0]["hooks"][0]["command"])
-                for event_name in ("SessionStart", "Stop"):
+                for event_name in MODULE.HOOK_EVENTS:
                     managed = [
                         handler
                         for group in payload["hooks"][event_name]
@@ -414,7 +418,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
 
     def test_remove_reports_removed_hooks_when_configuration_is_unmanaged(self):
         config = """[otel]
-exporter = { otlp-http = { endpoint = "https://ingest.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
+exporter = { otlp-http = { endpoint = "https://ingest-staging.vantage.sh/v1/logs", headers = { authorization = "Bearer existing-token" } } }
 """
 
         with tempfile.TemporaryDirectory() as codex_home:

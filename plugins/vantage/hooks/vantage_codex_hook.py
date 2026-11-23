@@ -1,694 +1,153 @@
 #!/usr/bin/env python3
-"""Send privacy-conscious Codex turn attribution to Vantage as an OTLP log.
-
-This hook reads only structural turn metadata and token totals from Codex
-transcripts. It never sends prompts, responses, tool data, transcript paths, or
-workspace file contents. Failures never block or continue the Codex turn. It
-intentionally uses only the Python standard library.
+"""Vantage Codex attribution hook. Run directly with Python 3.9+ on POSIX.
+SQLite captures evidence. A detached copy of this script exports OTLP/gRPC.
 """
 
+from __future__ import annotations
+
 import argparse
-import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
+from functools import lru_cache
 import re
+import random
+import platform
+import shlex
+import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
+
+COMMON = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+)
 
 
-SCHEMA_VERSION = "1"
+@dataclass(frozen=True)
+class Agent:
+    turn_field: str
+    events: tuple[str, ...]
+    child_owner_field: str | None = None
+
+    def session(self, payload):
+        return identifier(
+            payload.get(self.child_owner_field) or payload.get("session_id")
+        )
+
+
+AGENTS = {
+    "codex": Agent(
+        "turn_id", COMMON + ("PostModelRequest", "SubagentStart"), "agent_id"
+    ),
+    "claude_code": Agent("prompt_id", COMMON),
+}
+
+
+def identifier(value):
+    return (
+        value
+        if isinstance(value, str) and re.fullmatch(r"[\w.:/-]{1,180}", value, re.ASCII)
+        else None
+    )
+
+
+def git_email(cwd):
+    """Read the effective config in the agent's worktree; never inspect commit authors."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None  # No observation. Keep any earlier observation for this turn.
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "config", "--get", "user.email"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return None
+    email = result.stdout.rstrip("\r\n")
+    if (
+        result.returncode == 0
+        and len(email) <= 254
+        and re.fullmatch(r"[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+", email)
+    ):
+        return email
+    return ""  # Missing/invalid config clears a previous observation.
+
+
+def git_facts(cwd, salt):
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return {}
+
+    def git(*args):
+        p = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    try:
+        worktree = git("rev-parse", "--absolute-git-dir")
+        if not worktree:
+            return {}
+        facts = {
+            "worktree": hashlib.sha256(salt + os.fsencode(worktree)).hexdigest(),
+            "branch": git("symbolic-ref", "--short", "-q", "HEAD"),
+            "head": git("rev-parse", "--verify", "HEAD"),
+        }
+        default_ref = git("symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
+        if default_ref.startswith("origin/") and facts["branch"]:
+            facts["branch_is_default"] = facts["branch"] == default_ref.removeprefix(
+                "origin/"
+            )
+        remote = git("remote", "get-url", "origin")
+        if "://" not in remote:
+            remote = re.sub(r"^([\w.-]+@)?([\w.-]+):", r"ssh://\2/", remote)
+        url = urlsplit(remote)
+        if url.hostname and url.scheme in {"https", "http", "ssh", "git"}:
+            repo = url.path.strip("/").removesuffix(".git")
+            parts = repo.split("/")
+            if len(parts) >= 2 and re.fullmatch(r"[\w./-]+", repo) and not any(part in {"", ".", ".."} for part in parts):
+                facts["repository"] = f"{url.hostname}/{repo}"
+        return facts
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+REQUEST = "vantage.request_correlation"
+TURN = "vantage.turn_attribution"
+HOME = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser().resolve()
 PLUGIN_VERSION = "0.5.0"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
-EVENT_NAME = "codex.turn.attribution"
-DEFAULT_ENDPOINT = "https://ingest.vantage.sh"
 DEFAULT_CLASSIFIER_ENDPOINT = "https://api.vantage.sh/plugins/realtime_ai_classifier"
-INGEST_ENDPOINT = f"{DEFAULT_ENDPOINT}/v1/logs"
 MAX_CLASSIFIER_BYTES = 64 * 1024
 CLASSIFIER_TIMEOUT = 2
-INGEST_TIMEOUT = 5
-SESSION_RETRY_TIMEOUT = 1
-TAG_SECONDS = 604_800
-TURN_STATE_VERSION = 1
-MAX_REGISTERED_TRANSCRIPTS = 50
-MAX_OUTBOX_RECORDS = 100
-MAX_CLASSIFICATION_TAGS = 32
-MAX_CLASSIFICATION_VALUE_LENGTH = 512
-CLASSIFICATION_TAG_KEY = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
-GITHUB_REPOSITORY = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
-TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
-MANAGED_BLOCK = re.compile(
-    r"# BEGIN Vantage telemetry.*?# END Vantage telemetry", re.DOTALL
-)
-OTEL_SECTION = re.compile(
-    r"^\s*\[\s*otel\s*\]\s*(?:#.*)?$.*?(?=^\s*\[|\Z)",
-    re.MULTILINE | re.DOTALL,
-)
-
-
-def run(
-    stdin=sys.stdin,
-    env=os.environ,
-    stdout=sys.stdout,
-    stderr=sys.stderr,
-    now_ns=None,
-):
-    try:
-        payload = json.loads(stdin.read() or "")
-        if isinstance(payload, dict):
-            handle(payload, env=env, stdout=stdout, stderr=stderr, now_ns=now_ns)
-    except json.JSONDecodeError:
-        return
-    except Exception as error:  # Hooks must never interrupt the Codex turn.
-        print(
-            f"[vantage_codex_hook] {type(error).__name__}: {error}",
-            file=stderr,
-        )
-
-
-def tag(
-    argv,
-    env=os.environ,
-    stdout=sys.stdout,
-    stderr=sys.stderr,
-):
-    try:
-        parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-        parser.add_argument("--session")
-        parser.add_argument("--tag", action="append", default=[])
-        parsed = vars(parser.parse_args(argv))
-        session_id = (parsed.pop("session") or "").strip()
-        if not session_id:
-            raise ValueError("--session is required")
-
-        raw_tags = parsed.pop("tag")
-        options = {}
-        for raw_tag in raw_tags:
-            key, separator, value = raw_tag.partition("=")
-            if not separator:
-                raise ValueError("--tag must use key=value")
-            add_classification_tag(options, key, value)
-        if not options:
-            raise ValueError("give at least one tag")
-
-        if not update_tags(env, session_id, options):
-            raise ValueError("could not save tags")
-
-        print(
-            f"Saved tags for session {session_id}. "
-            "They are sent with this turn's record.",
-            file=stdout,
-        )
-        return 0
-    except (Exception, SystemExit) as error:
-        message = "invalid tag arguments" if isinstance(error, SystemExit) else str(error)
-        print(f"[vantage_codex_hook] {message}", file=stderr)
-        return 1
-
-
-def deliver(
-    body,
-    *,
-    token,
-    endpoint,
-    stderr=sys.stderr,
-    timeout=INGEST_TIMEOUT,
-):
-    url = urllib.parse.urljoin(endpoint, "/v1/logs")
-    parsed = urllib.parse.urlparse(url)
-    if not https_or_loopback(parsed):
-        raise ValueError(f"refusing to send the ingest token over {parsed.scheme}")
-
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-        method="POST",
-    )
-    try:
-        response = urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        print(f"[vantage_codex_hook] ingest responded {error.code}", file=stderr)
-        return error
-
-    status = getattr(response, "status", 200)
-    if not 200 <= status < 300:
-        print(f"[vantage_codex_hook] ingest responded {status}", file=stderr)
-    return response
-
-
-def handle(
-    payload,
-    *,
-    env,
-    stdout,
-    stderr,
-    now_ns,
-):
-    events_path = str(env.get("VANTAGE_CODEX_EVENTS_PATH", "")).strip()
-    if payload.get("hook_event_name") == "SessionStart":
-        session_id = str(payload.get("session_id") or "").strip()
-        refresh_classifier(env, stderr=stderr)
-        classifier = classifier_markdown_path(env)
-        if session_id and classifier.is_file():
-            print(attribution_context(session_id, classifier), file=stdout)
-        if outbox_path(env).is_file():
-            retry_outbox(
-                env,
-                events_path=events_path,
-                stderr=stderr,
-                timeout=SESSION_RETRY_TIMEOUT,
-            )
-        return
-
-    token = ingest_token(env)
-    if not events_path and not token:
-        return
-
-    with turn_state_lock(env):
-        bodies = turn_requests(payload, env=env, now_ns=now_ns)
-        flush_outbox(
-            env,
-            bodies,
-            events_path=events_path,
-            token=token,
-            stderr=stderr,
-            timeout=INGEST_TIMEOUT,
-        )
-
-
-def retry_outbox(env, *, events_path, stderr, timeout):
-    token = "" if events_path else ingest_token(env)
-    if not events_path and not token:
-        return
-    with turn_state_lock(env):
-        flush_outbox(
-            env,
-            load_outbox(env),
-            events_path=events_path,
-            token=token,
-            stderr=stderr,
-            timeout=timeout,
-        )
-
-
-def flush_outbox(env, bodies, *, events_path, token, stderr, timeout):
-    if not bodies:
-        return
-    if events_path:
-        for body in bodies:
-            append_local(body, events_path)
-        save_outbox(env, [])
-        return
-    try:
-        response = deliver(
-            batch_requests(bodies),
-            token=token,
-            endpoint=endpoint_for(env),
-            stderr=stderr,
-            timeout=timeout,
-        )
-        status = getattr(response, "status", 200)
-        if 200 <= status < 300:
-            save_outbox(env, [])
-            return
-    except (OSError, ValueError, urllib.error.URLError):
-        pass
-    save_outbox(env, bodies)
-
-
-def batch_requests(bodies):
-    resource_logs = []
-    for body in bodies:
-        if isinstance(body, dict) and isinstance(body.get("resourceLogs"), list):
-            resource_logs.extend(body["resourceLogs"])
-    return {"resourceLogs": resource_logs}
-
-
-def turn_requests(payload, env=os.environ, now_ns=None):
-    if payload.get("hook_event_name") != "Stop":
-        return load_outbox(env)
-
-    session_id = str(payload.get("session_id") or "").strip()
-    turn_id = str(payload.get("turn_id") or "").strip()
-    if not session_id or not turn_id:
-        return load_outbox(env)
-
-    git = workspace_tags(str(payload.get("cwd") or "")) or {}
-    tags = skill_tags(env, session_id)
-    state = load_turn_state(env)
-    changed = update_turn_state(
-        state,
-        payload,
-        now_ns if now_ns is not None else time.time_ns(),
-    )
-    requests = []
-    for summary in changed:
-        summary_turn_id = str(summary.get("turn_id") or "").strip()
-        if not summary_turn_id:
-            continue
-        summary_session_id = str(summary.get("session_id") or session_id).strip()
-        signature = turn_signature(summary, git, tags)
-        if summary.get("emitted_signature") == signature:
-            continue
-        revision = max(int(summary.get("revision") or 0), 0) + 1
-        summary["revision"] = revision
-        summary["emitted_signature"] = signature
-        attributes = turn_summary_attributes(summary, git, tags)
-        requests.append(
-            envelope(
-                EVENT_NAME,
-                summary_session_id,
-                git.get("repository"),
-                attributes,
-                now_ns if now_ns is not None else time.time_ns(),
-                "codex_hook",
-            )
-        )
-
-    queued = deduplicate_requests(load_outbox(env) + requests)
-    save_outbox(env, queued)
-    save_turn_state(env, state)
-    return queued
-
-
-def transcript_file(payload):
-    raw = str(payload.get("transcript_path") or "").strip()
-    if not raw:
-        return None
-    path = Path(raw).expanduser()
-    try:
-        return path if path.is_file() else None
-    except OSError:
-        return None
-
-
-def update_turn_state(state, payload, stopped_at_ns):
-    session_id = str(payload.get("session_id") or "").strip()
-    current_turn_id = str(payload.get("turn_id") or "").strip()
-    path = transcript_file(payload)
-    changed_ids = set()
-    current_start_ns = stopped_at_ns
-
-    if path is not None:
-        transcript_key = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
-        transcripts = state.setdefault("transcripts", {})
-        transcript = transcripts.setdefault(
-            transcript_key,
-            {"path": str(path.resolve()), "offset": 0, "session_id": session_id},
-        )
-        transcript["path"] = str(path.resolve())
-        transcript["session_id"] = session_id
-        offset = max(int(transcript.get("offset") or 0), 0)
-        try:
-            size = path.stat().st_size
-            if size < offset:
-                offset = 0
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                while True:
-                    line_start = handle.tell()
-                    line = handle.readline()
-                    if not line:
-                        break
-                    if not line.endswith(b"\n"):
-                        handle.seek(line_start)
-                        break
-                    offset = handle.tell()
-                    try:
-                        record = json.loads(line.decode("utf-8"))
-                    except (UnicodeError, json.JSONDecodeError):
-                        continue
-                    changed_ids.update(apply_transcript_record(state, session_id, record))
-            transcript["offset"] = offset
-            transcript["seen_at_ns"] = stopped_at_ns
-        except OSError:
-            pass
-        prune_transcripts(transcripts)
-
-    turns = state.setdefault("turns", {})
-    current_key = turn_key(session_id, current_turn_id)
-    current = turns.setdefault(
-        current_key,
-        new_turn_summary(session_id, current_turn_id, stopped_at_ns),
-    )
-    if path is None:
-        current["last_seen_ns"] = max(
-            int(current.get("last_seen_ns") or 0), stopped_at_ns
-        )
-    current_start_ns = int(current.get("started_at_ns") or stopped_at_ns)
-    changed_ids.add(current_key)
-
-    for key, summary in turns.items():
-        if key == current_key or summary.get("state") == "completed":
-            continue
-        if str(summary.get("session_id") or "") != session_id:
-            continue
-        last_seen_ns = int(summary.get("last_seen_ns") or 0)
-        if last_seen_ns and last_seen_ns < current_start_ns:
-            summary["state"] = "interrupted"
-            summary["ended_at_ns"] = last_seen_ns
-            summary["recovered"] = True
-            changed_ids.add(key)
-
-    changed = [turns[key] for key in changed_ids if key in turns]
-    changed.sort(key=lambda value: (int(value.get("started_at_ns") or 0), value.get("turn_id", "")))
-    return changed
-
-
-def apply_transcript_record(state, session_id, record):
-    if not isinstance(record, dict):
-        return set()
-    record_type = record.get("type")
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return set()
-    timestamp_ns = parse_timestamp_ns(record.get("timestamp"))
-    if timestamp_ns is None:
-        return set()
-
-    root_turn_id = str(payload.get("root_turn_id") or payload.get("turn_id") or "").strip()
-    if not root_turn_id:
-        attribution = payload.get("turn_attribution")
-        if isinstance(attribution, dict):
-            root_turn_id = str(
-                attribution.get("root_turn_id") or attribution.get("turn_id") or ""
-            ).strip()
-    if not root_turn_id:
-        return set()
-
-    key = turn_key(session_id, root_turn_id)
-    turns = state.setdefault("turns", {})
-    summary = turns.setdefault(
-        key,
-        new_turn_summary(session_id, root_turn_id, timestamp_ns),
-    )
-    summary["started_at_ns"] = min(
-        int(summary.get("started_at_ns") or timestamp_ns), timestamp_ns
-    )
-    summary["last_seen_ns"] = max(
-        int(summary.get("last_seen_ns") or 0), timestamp_ns
-    )
-
-    event_type = str(payload.get("type") or "")
-    event_turn_id = str(payload.get("turn_id") or "").strip()
-    if record_type == "turn_context" and event_turn_id == root_turn_id:
-        model = str(payload.get("model") or "").strip()
-        if model:
-            summary["model"] = model
-    elif (
-        record_type == "event_msg"
-        and event_type == "task_started"
-        and event_turn_id == root_turn_id
-    ):
-        summary["started_at_ns"] = timestamp_ns
-    elif (
-        record_type == "event_msg"
-        and event_type == "task_complete"
-        and event_turn_id == root_turn_id
-    ):
-        summary["state"] = "completed"
-        summary["ended_at_ns"] = timestamp_ns
-    elif record_type == "token_usage_record":
-        leaf_turn_id = str(payload.get("turn_id") or root_turn_id).strip()
-        usage = payload.get("turn_token_usage")
-        if isinstance(usage, dict):
-            leaves = summary.setdefault("leaf_usage", {})
-            previous = leaves.get(leaf_turn_id)
-            if not isinstance(previous, dict) or timestamp_ns >= int(previous.get("at_ns") or 0):
-                leaves[leaf_turn_id] = {
-                    "at_ns": timestamp_ns,
-                    "input_tokens": nonnegative_int(usage.get("input_tokens")),
-                    "cached_input_tokens": nonnegative_int(usage.get("cached_input_tokens")),
-                    "cache_write_input_tokens": nonnegative_int(usage.get("cache_write_input_tokens")),
-                    "output_tokens": nonnegative_int(usage.get("output_tokens")),
-                    "reasoning_output_tokens": nonnegative_int(usage.get("reasoning_output_tokens")),
-                    "total_tokens": nonnegative_int(usage.get("total_tokens")),
-                }
-        response_id = str(payload.get("response_id") or "").strip()
-        if response_id:
-            responses = summary.setdefault("response_ids", [])
-            if response_id not in responses:
-                responses.append(response_id)
-    return {key}
-
-
-def new_turn_summary(session_id, turn_id, timestamp_ns):
-    return {
-        "session_id": session_id,
-        "turn_id": turn_id,
-        "started_at_ns": timestamp_ns,
-        "last_seen_ns": timestamp_ns,
-        "ended_at_ns": 0,
-        "state": "partial",
-        "recovered": False,
-        "model": "",
-        "leaf_usage": {},
-        "response_ids": [],
-        "revision": 0,
-    }
-
-
-def turn_summary_attributes(summary, git, tags):
-    usage = turn_usage(summary)
-    session_id = str(summary.get("session_id") or "")
-    turn_id = str(summary.get("turn_id") or "")
-    values = [
-        string_attribute("codex.turn.id", turn_id),
-        string_attribute("vantage.turn.logical_id", turn_logical_id(session_id, turn_id)),
-        integer_attribute("vantage.turn.revision", summary.get("revision")),
-        string_attribute("vantage.turn.state", summary.get("state")),
-        boolean_attribute("vantage.turn.recovered", bool(summary.get("recovered"))),
-        integer_attribute("codex.turn.started_at_unix_nano", summary.get("started_at_ns")),
-        integer_attribute("codex.turn.ended_at_unix_nano", summary.get("ended_at_ns")),
-        integer_attribute("codex.turn.request_count", len(summary.get("response_ids") or [])),
-        integer_attribute("codex.turn.input_token_count", usage["input_tokens"]),
-        integer_attribute("codex.turn.cached_input_token_count", usage["cached_input_tokens"]),
-        integer_attribute("codex.turn.cache_write_input_token_count", usage["cache_write_input_tokens"]),
-        integer_attribute("codex.turn.output_token_count", usage["output_tokens"]),
-        integer_attribute("codex.turn.reasoning_output_token_count", usage["reasoning_output_tokens"]),
-        integer_attribute("codex.turn.total_token_count", usage["total_tokens"]),
-        string_attribute("model", summary.get("model")),
-        string_attribute("vcs.ref.head.name", git.get("branch")),
-    ]
-    return compact(values) + classification_attributes(tags)
-
-
-def turn_usage(summary):
-    totals = {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "cache_write_input_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_output_tokens": 0,
-        "total_tokens": 0,
-    }
-    leaves = summary.get("leaf_usage")
-    if not isinstance(leaves, dict):
-        return totals
-    for usage in leaves.values():
-        if not isinstance(usage, dict):
-            continue
-        for key in totals:
-            totals[key] += nonnegative_int(usage.get(key))
-    return totals
-
-
-def turn_signature(summary, git, tags):
-    value = {
-        "turn_id": summary.get("turn_id"),
-        "started_at_ns": summary.get("started_at_ns"),
-        "ended_at_ns": summary.get("ended_at_ns"),
-        "state": summary.get("state"),
-        "recovered": bool(summary.get("recovered")),
-        "model": summary.get("model"),
-        "request_count": len(summary.get("response_ids") or []),
-        "usage": turn_usage(summary),
-        "repository": git.get("repository"),
-        "branch": git.get("branch"),
-        "tags": tags,
-    }
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def turn_logical_id(session_id, turn_id):
-    value = f"codex:{session_id}:{turn_id}".encode("utf-8")
-    return hashlib.sha256(value).hexdigest()
-
-
-def turn_key(session_id, turn_id):
-    return f"{session_id}:{turn_id}"
-
-
-def parse_timestamp_ns(value):
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return int(parsed.timestamp() * 1_000_000_000)
-    except (ValueError, OverflowError):
-        return None
-
-
-def nonnegative_int(value):
-    try:
-        return max(int(value), 0)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def turn_state_path(env):
-    configured = str(env.get("VANTAGE_CODEX_HOOK_STATE_DIR", "")).strip()
-    directory = Path(configured) if configured else classifier_directory(env)
-    return directory / "turn_state.json"
-
-
-def outbox_path(env):
-    return turn_state_path(env).with_name("turn_outbox.json")
-
-
-@contextlib.contextmanager
-def turn_state_lock(env):
-    path = turn_state_path(env).with_name("turn_state.lock")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(descriptor, "a+") as handle:
-        lock_file(handle)
-        yield
-
-
-def load_turn_state(env):
-    try:
-        value = json.loads(turn_state_path(env).read_text(encoding="utf-8"))
-        if isinstance(value, dict) and value.get("version") == TURN_STATE_VERSION:
-            value.setdefault("transcripts", {})
-            value.setdefault("turns", {})
-            return value
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        pass
-    return {"version": TURN_STATE_VERSION, "transcripts": {}, "turns": {}}
-
-
-def save_turn_state(env, state):
-    prune_turns(state.setdefault("turns", {}))
-    write_private_file(
-        turn_state_path(env),
-        json.dumps(state, separators=(",", ":"), sort_keys=True).encode("utf-8"),
-    )
-
-
-def load_outbox(env):
-    try:
-        value = json.loads(outbox_path(env).read_text(encoding="utf-8"))
-        return value if isinstance(value, list) else []
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
-
-
-def save_outbox(env, bodies):
-    bodies = deduplicate_requests(bodies)[-MAX_OUTBOX_RECORDS:]
-    if not bodies:
-        try:
-            outbox_path(env).unlink()
-        except FileNotFoundError:
-            pass
-        return
-    write_private_file(
-        outbox_path(env),
-        json.dumps(bodies, separators=(",", ":")).encode("utf-8"),
-    )
-
-
-def deduplicate_requests(bodies):
-    seen = set()
-    output = []
-    for body in bodies:
-        event_id = request_attribute(body, "vantage.event_id")
-        if not event_id or event_id in seen:
-            continue
-        seen.add(event_id)
-        output.append(body)
-    return output
-
-
-def request_attribute(body, key):
-    try:
-        attributes = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
-        for attribute in attributes:
-            if attribute.get("key") == key:
-                value = attribute.get("value")
-                if isinstance(value, dict):
-                    return str(value.get("stringValue") or "")
-    except (KeyError, IndexError, TypeError):
-        pass
-    return ""
-
-
-def prune_transcripts(transcripts):
-    while len(transcripts) > MAX_REGISTERED_TRANSCRIPTS:
-        oldest = min(
-            transcripts,
-            key=lambda key: int(transcripts[key].get("seen_at_ns") or 0),
-        )
-        del transcripts[oldest]
-
-
-def prune_turns(turns):
-    maximum = MAX_REGISTERED_TRANSCRIPTS * 50
-    while len(turns) > maximum:
-        oldest = min(turns, key=lambda key: int(turns[key].get("last_seen_ns") or 0))
-        del turns[oldest]
-
-
-def ingest_token(env):
-    try:
-        config = (codex_home(env) / "config.toml").read_text(encoding="utf-8")
-        managed_match = MANAGED_BLOCK.search(config)
-        if managed_match:
-            token_match = TOKEN.search(managed_match.group(0))
-            if token_match:
-                return token_match.group(1)
-
-        section_match = OTEL_SECTION.search(config)
-        section = section_match.group(0) if section_match else ""
-        exporter = next(
-            (
-                line
-                for line in section.splitlines()
-                if not line.lstrip().startswith("#")
-                and re.match(r"^\s*exporter\s*=", line)
-                and INGEST_ENDPOINT in line
-            ),
-            None,
-        )
-        if exporter is None:
-            exporter = next(
-                (
-                    line
-                    for line in config.splitlines()
-                    if not line.lstrip().startswith("#")
-                    and re.match(r"^\s*otel\.exporter\s*=", line)
-                    and INGEST_ENDPOINT in line
-                ),
-                "",
-            )
-        token_match = TOKEN.search(exporter)
-        return token_match.group(1) if token_match else ""
-    except (OSError, UnicodeError):
-        return ""
+CONNECTION = HOME / "vantage" / "connection.json"
+ENDPOINT = None
+STATE = None
+TOKEN = None
+OPT_IN = None
+SOURCE = "tag"
 
 
 def codex_home(env):
@@ -799,228 +258,6 @@ def write_private_file(path, content):
         raise
 
 
-def append_local(body, path):
-    destination = Path(path)
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(destination, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        lock_file(handle)
-        handle.write(json.dumps(body, separators=(",", ":")) + "\n")
-
-
-def endpoint_for(env):
-    return str(env.get("VANTAGE_CODEX_INGEST_ENDPOINT", "")).strip() or DEFAULT_ENDPOINT
-
-
-def attribution_context(session_id, classifier):
-    command = f'"{sys.executable}" "{Path(__file__).resolve()}" tag --session {session_id}'
-    return (
-        f"Vantage session attribution command for this Codex session: {command}\n"
-        f"Vantage classifier file for this session: {classifier}\n"
-        "Use the vantage-session-attribution skill to read that classifier and "
-        "append only the flags it directs."
-    )
-
-
-def envelope(
-    event_name,
-    session_id,
-    repository,
-    attributes,
-    now_ns,
-    source,
-):
-    timestamp = str(now_ns)
-    return {
-        "resourceLogs": [
-            {
-                "resource": {
-                    "attributes": compact(
-                        [
-                            string_attribute("service.name", "codex"),
-                            string_attribute("vcs.repository.name", repository),
-                            string_attribute("vantage.source", source),
-                            string_attribute("vantage.schema_version", SCHEMA_VERSION),
-                        ]
-                    )
-                },
-                "scopeLogs": [
-                    {
-                        "scope": {
-                            "name": "vantage.codex_hooks",
-                            "version": SCHEMA_VERSION,
-                        },
-                        "logRecords": [
-                            {
-                                "timeUnixNano": timestamp,
-                                "observedTimeUnixNano": timestamp,
-                                "severityNumber": 9,
-                                "severityText": "INFO",
-                                "eventName": event_name,
-                                "body": {"stringValue": event_name},
-                                "attributes": compact(
-                                    [
-                                        string_attribute("event.name", event_name),
-                                        string_attribute("vantage.event_id", str(uuid.uuid4())),
-                                        string_attribute("conversation.id", session_id),
-                                    ]
-                                )
-                                + attributes,
-                            }
-                        ],
-                    }
-                ],
-            }
-        ]
-    }
-
-
-def workspace_tags(root):
-    if not root or not Path(root).is_dir():
-        return None
-
-    top = git_output(["git", "-C", root, "rev-parse", "--show-toplevel"])
-    if top is None:
-        return None
-    branch = git_output(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"])
-    if branch == "HEAD":
-        branch = None
-    remote = git_output(["git", "-C", root, "remote", "get-url", "origin"])
-    repository = github_repository(remote)
-    tags = {
-        "repository": repository or Path(top).name,
-        "branch": branch,
-    }
-    return tags
-
-
-def git_output(argv):
-    stdout, ok = capture(argv)
-    output = stdout.strip()
-    return output if ok and output else None
-
-
-def github_repository(remote):
-    match = GITHUB_REPOSITORY.search(remote or "")
-    return match.group(1) if match else None
-
-
-def skill_tags(env, session_id):
-    try:
-        current = json.loads((state_dir(env) / "tags.json").read_text(encoding="utf-8"))
-        entry = current.get(session_id) if isinstance(current, dict) else None
-        if not isinstance(entry, dict):
-            return {}
-        tagged_at = entry.get("at")
-        if not isinstance(tagged_at, int) or not 0 <= int(time.time()) - tagged_at <= TAG_SECONDS:
-            return {}
-        return {
-            key: value
-            for key, value in entry.items()
-            if key != "at" and valid_classification_tag(key, value)
-        }
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-
-
-def valid_classification_tag(key, value):
-    return (
-        isinstance(key, str)
-        and CLASSIFICATION_TAG_KEY.fullmatch(key) is not None
-        and isinstance(value, str)
-        and bool(value)
-        and len(value) <= MAX_CLASSIFICATION_VALUE_LENGTH
-        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
-    )
-
-
-def add_classification_tag(tags, key, value):
-    key = key.strip()
-    value = value.strip()
-    if not valid_classification_tag(key, value):
-        raise ValueError("classification tags require a lowercase key and a non-empty value")
-    if key not in tags and len(tags) >= MAX_CLASSIFICATION_TAGS:
-        raise ValueError(f"at most {MAX_CLASSIFICATION_TAGS} classification tags are allowed")
-    tags[key] = value
-
-
-def classification_attributes(tags):
-    return compact(
-        [
-            string_attribute(f"vantage.classification.{key}", value)
-            for key, value in sorted(tags.items())
-            if valid_classification_tag(key, value)
-        ]
-    )
-
-
-def update_tags(
-    env, session_id, options
-):
-    try:
-        directory = state_dir(env)
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = directory / "tags.json"
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
-            lock_file(handle)
-            raw = handle.read()
-            current = json.loads(raw) if raw.strip() else {}
-            if not isinstance(current, dict):
-                current = {}
-
-            now = int(time.time())
-            current = {
-                key: entry
-                for key, entry in current.items()
-                if isinstance(entry, dict)
-                and isinstance(entry.get("at"), int)
-                and 0 <= now - entry["at"] <= TAG_SECONDS
-            }
-            current.pop(session_id, None)
-            current[session_id] = {**options, "at": now}
-            while len(current) > 200 and next(iter(current)) != session_id:
-                del current[next(iter(current))]
-
-            handle.seek(0)
-            handle.truncate()
-            json.dump(current, handle, separators=(",", ":"))
-        return True
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-
-
-def state_dir(env):
-    configured = str(env.get("VANTAGE_CODEX_HOOK_STATE_DIR", ""))
-    return Path(configured) if configured else Path(tempfile.gettempdir()) / "vantage-codex-hook"
-
-
-def capture(argv):
-    try:
-        environment = os.environ.copy()
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        result = subprocess.run(
-            argv,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-        return result.stdout, result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return "", False
-
-
-def lock_file(handle):
-    try:
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except (ImportError, OSError):
-        return
-
-
 def https_or_loopback(parsed):
     return parsed.scheme == "https" or (
         parsed.scheme == "http"
@@ -1028,34 +265,705 @@ def https_or_loopback(parsed):
     )
 
 
-def string_attribute(key, value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return {"key": key, "value": {"stringValue": text}}
+def load_connection():
+    global STATE, TOKEN, OPT_IN, ENDPOINT
+    connection = json.loads(CONNECTION.read_text())
+    TOKEN = connection["token"]
+    ENDPOINT = connection["endpoint"]
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{8,512}", TOKEN) or not https_or_loopback(urlsplit(ENDPOINT)):
+        raise ValueError("invalid ingest connection")
+    binding = hashlib.sha256((ENDPOINT + "\0" + TOKEN).encode()).hexdigest()
+    STATE = CONNECTION.parent / "outbox" / binding
+    OPT_IN = connection["since_ns"]
 
 
-def integer_attribute(key, value):
+def connect():
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(STATE / "state.sqlite", timeout=5, isolation_level=None)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            agent TEXT, session TEXT, home TEXT, offset INTEGER DEFAULT 0,
+            PRIMARY KEY(agent, session));
+        CREATE TABLE IF NOT EXISTS turns (
+            agent TEXT, session TEXT, turn TEXT, revision INTEGER, state TEXT,
+            PRIMARY KEY(agent, session, turn));
+        CREATE TABLE IF NOT EXISTS outbox (
+            id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT);
+        CREATE TABLE IF NOT EXISTS git_identity (
+            agent TEXT, session TEXT, turn TEXT, at_ns INTEGER, email TEXT NOT NULL,
+            PRIMARY KEY(agent, session, turn, at_ns));
+        CREATE TABLE IF NOT EXISTS install (id INTEGER PRIMARY KEY, salt BLOB NOT NULL);
+        INSERT OR IGNORE INTO install VALUES (1,randomblob(16));
+        CREATE TABLE IF NOT EXISTS diagnostics (name TEXT PRIMARY KEY, count INTEGER);
+        CREATE TABLE IF NOT EXISTS cli_versions (agent TEXT, session TEXT, version TEXT,
+            PRIMARY KEY(agent, session));
+        CREATE TABLE IF NOT EXISTS turn_models (agent TEXT, session TEXT, turn TEXT, model TEXT,
+            PRIMARY KEY(agent, session, turn, model));
+        CREATE TABLE IF NOT EXISTS sender (id INTEGER PRIMARY KEY, failures INTEGER DEFAULT 0,
+            retry_at REAL DEFAULT 0, last_ack REAL DEFAULT 0, discovered REAL DEFAULT 0);
+        INSERT OR IGNORE INTO sender(id) VALUES(1);
+        CREATE TABLE IF NOT EXISTS recovery_queue (session TEXT PRIMARY KEY, generation INTEGER);
+        CREATE TABLE IF NOT EXISTS rollout_paths (session TEXT PRIMARY KEY, path TEXT);
+        CREATE TABLE IF NOT EXISTS versions_at (agent TEXT, session TEXT, at_ns INTEGER, version TEXT,
+            PRIMARY KEY(agent,session,at_ns));
+    """)
+    return db
+
+
+@contextmanager
+def write(db):
+    db.execute("BEGIN IMMEDIATE")
     try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if number < 0:
-        return None
-    return {"key": key, "value": {"intValue": str(number)}}
+        yield
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
 
 
-def boolean_attribute(key, value):
-    return {"key": key, "value": {"boolValue": bool(value)}}
+def observed_email(db, key, at_ns):
+    row = db.execute(
+        "SELECT email FROM git_identity WHERE agent=? AND session=? AND turn=? "
+        "AND at_ns<=? ORDER BY at_ns DESC LIMIT 1",
+        (*key, at_ns),
+    ).fetchone()
+    return row[0] if row else ""
 
 
-def compact(values):
-    return [value for value in values if value is not None]
+@lru_cache(maxsize=1)
+def device_facts():
+    return {"os.type": platform.system().lower(), "os.version": platform.release(),
+            "host.arch": platform.machine()}
+
+
+def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
+    agent, session, turn = key
+    event_id = event_id or str(uuid.uuid4())
+    timestamp = timestamp if timestamp is not None else time.time_ns()
+    email = observed_email(db, key, timestamp)
+    version = db.execute("SELECT version FROM versions_at WHERE agent=? AND session=? AND at_ns<=? "
+                         "ORDER BY at_ns DESC LIMIT 1", (*key[:2], timestamp)).fetchone()
+    models = [row[0] for row in db.execute("SELECT model FROM turn_models WHERE agent=? AND session=? AND turn=?", key)]
+    turn_model = models[0] if len(models) == 1 else "multiple" if models else "unknown"
+    summary = kind == TURN
+    payload = {
+        "git.identity.source": "git_config" if email else "unknown",
+        "agent.version": version[0] if version else "unknown",
+        "model.source": ("turn" if models else "unknown") if summary else ("request" if attrs.get("model") else "unknown"),
+        "model": turn_model if summary else "unknown",
+        **({key: "unknown" for key in ("os.type", "os.version", "host.arch")}
+           if SOURCE == "rollout" else device_facts()),
+        "vantage.capture.source": SOURCE,
+        "vantage.plugin.version": PLUGIN_VERSION,
+        "vantage.schema.version": "1",
+        "event.name": kind,
+        "event_id": event_id,
+        "agent": agent,
+        "session.id": session,
+        "turn.id": turn,
+        **attrs,
+    }
+    if email:
+        payload["git.user.email"] = email
+    db.execute(
+        "INSERT OR IGNORE INTO outbox VALUES (?,?,?)",
+        (event_id, timestamp, json.dumps(payload)),
+    )
+
+
+def snapshot(
+    db, key, *, facts=None, changes=None, tags=None, tag_source="manual", timestamp=None
+):
+    row = db.execute(
+        "SELECT revision,state FROM turns WHERE agent=? AND session=? AND turn=?", key
+    ).fetchone()
+    revision, state = (
+        (row[0], json.loads(row[1])) if row else (0, {"tags": {}, "git": []})
+    )
+    previous = json.dumps(state, sort_keys=True)
+    if facts and (not state["git"] or state["git"][-1]["facts"] != facts):
+        state["git"].append({"at_ns": time.time_ns(), "facts": facts})
+    for k, v in (changes or {}).items():
+        if (
+            k in ("first_seen_ns", "first_source", "started_ns", "ended_ns")
+            and k in state
+        ):
+            continue
+        state[k] = v
+    for name, value in (tags or {}).items():
+        if value is None:
+            state["tags"].pop(name, None)
+            state.setdefault("tag_sources", {}).pop(name, None)
+        else:
+            state["tags"][name] = value
+            state.setdefault("tag_sources", {})[name] = tag_source
+    encoded = json.dumps(state, sort_keys=True)
+    while len(encoded.encode()) > 64 * 1024 and len(state["git"]) > 2:
+        del state["git"][1]
+        state["omitted_git_observations"] = state.get("omitted_git_observations", 0) + 1
+        encoded = json.dumps(state, sort_keys=True)
+    if row and previous == encoded:
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO turns VALUES (?,?,?,?,?)", (*key, revision + 1, encoded)
+    )
+    enqueue(
+        db, TURN, key, {"revision": revision + 1, "state": encoded}, timestamp=timestamp
+    )
+
+
+def correlation(
+    db, key, usage, source, *, status, model=None, response=None, **options
+):
+    attrs = {"source": source, "status": status}
+    if model:
+        attrs["model"] = model
+    if response:
+        attrs["response_id"] = response
+    for name in (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ):
+        value = (usage or {}).get(name)
+        if type(value) is int and 0 <= value < 2**63:
+            attrs["fp." + name] = value
+    enqueue(db, REQUEST, key, attrs, **options)
+
+
+def project(db, session, offset, line):
+    entry = json.loads(line)
+    if entry.get("type") == "session_meta":
+        meta = entry.get("payload", {})
+        version = identifier(meta.get("cli_version"))
+        if version and meta.get("id") == session:
+            when = datetime.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+            db.execute("INSERT OR REPLACE INTO versions_at VALUES ('codex',?,?,?)",
+                       (session, int(when.timestamp() * 1e9), version))
+        return
+    if entry.get("type") != "token_usage_record":
+        return
+    p = entry["payload"]
+    turn = identifier(p.get("turn_id"))
+    if p.get("thread_id") != session or not turn:
+        return
+    when = datetime.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))  # noqa: FURB162 -- Python 3.9
+    key = ("codex", session, turn)
+    ns = int(when.timestamp() * 1e9)
+    if OPT_IN and ns < OPT_IN:
+        return
+    response = identifier(p.get("response_id"))
+    event_id = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"codex:{session}:{response or offset}")
+    )
+    snapshot(
+        db, key, changes={"first_seen_ns": ns, "first_source": "rollout"}, timestamp=ns
+    )
+    correlation(
+        db,
+        key,
+        p["usage"],
+        "rollout",
+        status="completed",
+        response=response,
+        model=identifier(p.get("model")),
+        timestamp=ns,
+        event_id=event_id,
+    )
+
+
+def recover(db, targets=None, *, after_chunk=None):
+    sessions = db.execute("SELECT session,home,offset FROM sessions WHERE agent='codex'")
+    by_home = {str(HOME): {}} if OPT_IN else {}
+    for session, home, offset in sessions:
+        by_home.setdefault(home, {})[session] = offset
+    for home, offsets in by_home.items():
+        if targets is None:
+            paths = (path for directory in ("sessions", "archived_sessions")
+                     for path in (Path(home) / directory).rglob("*.jsonl"))
+        else:
+            paths = [Path(row[0]) for session in targets if session in offsets
+                     for row in db.execute("SELECT path FROM rollout_paths WHERE session=?", (session,))]
+        for path in paths:
+            # Codex file names end with the 36-character owning thread UUID.
+            session = path.stem[-36:]
+            if session not in offsets:
+                # Discover only threads created after setup for this binding.
+                # A UUIDv7 timestamp is independent of file copy or archive times.
+                try:
+                    thread = uuid.UUID(session)
+                except ValueError:
+                    continue
+                if not OPT_IN or thread.version != 7 or (thread.int >> 80) * 1_000_000 < OPT_IN:
+                    continue
+                db.execute("INSERT OR IGNORE INTO sessions(agent,session,home) VALUES ('codex',?,?)", (session, home))
+                offsets[session] = 0
+            offset = offsets[session]
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(offset if path.stat().st_size >= offset else 0)
+                    while True:
+                        lines = []
+                        for _ in range(128):
+                            start = stream.tell()
+                            line = stream.readline()
+                            if not line.endswith(b"\n"):
+                                stream.seek(start)
+                                break
+                            lines.append((start, line))
+                        if not lines:
+                            break
+                        with write(db):
+                            for start, line in lines:
+                                try:
+                                    project(db, session, start, line)
+                                except (
+                                    ValueError,
+                                    KeyError,
+                                    TypeError,
+                                    AttributeError,
+                                    OverflowError,
+                                ):
+                                    # Count malformed completed lines without recording their contents.
+                                    db.execute(
+                                        "INSERT INTO diagnostics VALUES ('invalid_rollout',1) ON CONFLICT(name) DO UPDATE SET count=count+1"
+                                    )
+                            db.execute(
+                                "UPDATE sessions SET offset=? WHERE agent='codex' AND session=?",
+                                (stream.tell(), session),
+                            )
+                        offsets[session] = stream.tell()
+                        if after_chunk:
+                            after_chunk(db)
+            except OSError:
+                db.execute("INSERT INTO diagnostics VALUES ('rollout_io_errors',1) "
+                           "ON CONFLICT(name) DO UPDATE SET count=count+1")
+                continue
+            db.execute("INSERT OR REPLACE INTO rollout_paths VALUES (?,?)", (session, str(path)))
+
+
+# The sender only produces OTLP logs with scalar attributes. curl owns the
+# HTTP/2 session and verifies transport errors. All protobuf field numbers
+# below come from opentelemetry-proto's logs/v1 and common/v1 schemas.
+def varint(value):
+    result = bytearray()
+    while value >= 128:
+        result.append((value & 127) | 128)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def message(number, payload):
+    return varint(number << 3 | 2) + varint(len(payload)) + payload
+
+
+def string(number, value):
+    return message(number, str(value).encode("utf-8"))
+
+
+def attribute(key, value):
+    if type(value) is int:
+        encoded = b"\x18" + varint(value & ((1 << 64) - 1))  # AnyValue.int_value
+    else:
+        encoded = string(1, value)
+    return string(1, key) + message(2, encoded)
+
+
+def encode_logs(service, records):
+    resource = message(1, attribute("service.name", service))
+    scope_logs = bytearray(message(1, string(1, service)))
+    for timestamp, attrs in records:
+        log = bytearray(
+            b"\x09" + struct.pack("<Q", timestamp)
+        )  # fixed64 time_unix_nano
+        log.extend(message(5, string(1, attrs["event.name"])))
+        for key, value in attrs.items():
+            log.extend(message(6, attribute(key, value)))
+        scope_logs.extend(message(2, log))
+    return message(1, message(1, resource) + message(2, scope_logs))
+
+
+def require_ack(headers, frame):
+    # gRPC can return an HTTP 200 for a failed RPC. Also require the final
+    # grpc-status and an empty ExportLogsServiceResponse (possibly containing
+    # an empty partial_success submessage, as emitted by the Collector).
+    fields = headers.lower().splitlines()
+    # HTTPS proxies may prepend their CONNECT response.
+    fields = fields[next((i for i in reversed(range(len(fields))) if fields[i].startswith(b"http/")), 0):]
+    statuses = [
+        line.partition(b":")[2].strip()
+        for line in fields
+        if line.startswith(b"grpc-status:")
+    ]
+    if (
+        not fields
+        or not re.fullmatch(rb"http/2 200\s*", fields[0])
+        or statuses != [b"0"]
+    ):
+        raise RuntimeError("collector did not acknowledge the gRPC export")
+    if frame not in (b"\x00\x00\x00\x00\x00", b"\x00\x00\x00\x00\x02\x0a\x00"):
+        raise RuntimeError(
+            "collector returned a partial or unrecognized response; batch retained"
+        )
+
+
+def export(service, records, *, token=None, endpoint=None):
+    body = encode_logs(service, records)
+    frame = b"\x00" + struct.pack(">I", len(body)) + body
+    url = f"{endpoint or ENDPOINT}/opentelemetry.proto.collector.logs.v1.LogsService/Export"
+    # Keep binary data on stdin/stdout. dump-header includes HTTP/2 trailers.
+    with tempfile.TemporaryFile() as headers, tempfile.TemporaryFile() as auth:
+        auth.write(f"authorization: Bearer {token or TOKEN}\n".encode())
+        auth.seek(0)
+        args = [
+            "curl",
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--http2",
+            "--header",
+            f"@/dev/fd/{auth.fileno()}",
+            "--max-time",
+            "5",
+            "--header",
+            "content-type: application/grpc",
+            "--header",
+            "te: trailers",
+            "--dump-header",
+            f"/dev/fd/{headers.fileno()}",
+            "--data-binary",
+            "@-",
+            url,
+        ]
+        reply = subprocess.run(
+            args,
+            input=frame,
+            stdout=subprocess.PIPE,
+            check=True,
+            pass_fds=(headers.fileno(), auth.fileno()),
+            timeout=7,
+        )
+        headers.seek(0)
+        require_ack(headers.read(), reply.stdout)
+
+
+def drain(db, *, single=False):
+    while rows := db.execute(
+        "SELECT id,timestamp,payload FROM outbox ORDER BY rowid LIMIT 64"
+    ).fetchall():
+        export("vantage-agent-hook", [(ts, json.loads(data)) for _, ts, data in rows])
+        with write(db):
+            db.executemany("DELETE FROM outbox WHERE id=?", [(row[0],) for row in rows])
+            db.execute("UPDATE sender SET failures=0,retry_at=0,last_ack=? WHERE id=1", (time.time(),))
+        if single:
+            return
+
+
+def schedule_recovery(db, session):
+    db.execute("INSERT INTO recovery_queue VALUES (?,1) ON CONFLICT(session) "
+               "DO UPDATE SET generation=generation+1", (session,))
+
+
+def send_batch_if_due(db):
+    failures, retry_at = db.execute("SELECT failures,retry_at FROM sender WHERE id=1").fetchone()
+    if retry_at > time.time():
+        return
+    try:
+        drain(db, single=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        delay = min(300, 5 * 2 ** min(failures, 6) * random.uniform(0.8, 1.2))
+        db.execute("UPDATE sender SET failures=failures+1,retry_at=? WHERE id=1",
+                   (time.time() + delay,))
+
+
+def run_sender(db, lock):
+    while True:
+        requests = db.execute("SELECT session,generation FROM recovery_queue").fetchall()
+        send_batch_if_due(db)
+        if requests:
+            targets = {session for session, _ in requests}
+            missing_path = db.execute("SELECT 1 FROM recovery_queue q LEFT JOIN rollout_paths p "
+                                      "USING(session) WHERE p.path IS NULL LIMIT 1").fetchone()
+            discovered = db.execute("SELECT discovered FROM sender").fetchone()[0]
+            discover = bool(missing_path) or time.time() - discovered >= 300
+            recover(db, None if discover else targets, after_chunk=send_batch_if_due)
+            with write(db):
+                if discover:
+                    db.execute("UPDATE sender SET discovered=? WHERE id=1", (time.time(),))
+                db.executemany("DELETE FROM recovery_queue WHERE session=? AND generation=?", requests)
+        # Serialize the idle decision with hook writes. A writer that commits
+        # after this check will find the lock available when it kicks the sender.
+        with write(db):
+            pending = db.execute("SELECT EXISTS(SELECT 1 FROM recovery_queue) OR "
+                                 "(retry_at<=? AND EXISTS(SELECT 1 FROM outbox)) FROM sender",
+                                 (time.time(),)).fetchone()[0]
+            if not pending:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                return
+
+
+def launch(db, recover_files=False, *, foreground=False, force=False):
+    if recover_files:
+        schedule_recovery(db, "*")
+    if force and foreground:
+        db.execute("UPDATE sender SET retry_at=0 WHERE id=1")
+    runnable = db.execute("SELECT EXISTS(SELECT 1 FROM recovery_queue) OR "
+                          "(retry_at<=? AND EXISTS(SELECT 1 FROM outbox)) FROM sender",
+                          (time.time(),)).fetchone()[0]
+    if not runnable:
+        return
+    with (STATE / "worker.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if foreground:
+            run_sender(db, lock)
+            return
+        subprocess.Popen(
+            [sys.executable, "-I", str(Path(__file__).resolve()), "send",
+             "--binding", STATE.name, "--lock-fd", str(lock.fileno())],
+            pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def installed_version():
+    try:
+        result = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            return identifier(result.stdout.strip().removeprefix("codex-cli "))
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def handle(db, name, payload):
+    global SOURCE
+    agent = AGENTS[name]
+    event = payload.get("hook_event_name")
+    session = agent.session(payload)
+    turn = identifier(payload.get(agent.turn_field))
+    if not session or event not in agent.events:
+        return
+    if event == "SessionStart":
+        refresh_classifier(os.environ)
+    SOURCE = event
+    model = identifier(payload.get("model"))
+    version = identifier(payload.get("cli_version") or payload.get("agent_version"))
+    if not version and name == "codex" and (event == "SessionStart" or not db.execute(
+        "SELECT 1 FROM cli_versions WHERE agent=? AND session=?", (name, session)).fetchone()):
+        version = installed_version() or "unknown"
+    key = (name, session, turn)
+    now = time.time_ns()
+    home = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())
+    tool = event in ("PreToolUse", "PostToolUse")
+    if tool and payload.get("tool_name") not in {
+        "Bash",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "exec_command",
+        "apply_patch",
+        "shell",
+        "shell_command",
+    }:
+        return
+    first = (
+        turn
+        and not db.execute(
+            "SELECT 1 FROM turns WHERE agent=? AND session=? AND turn=?", key
+        ).fetchone()
+    )
+    observe = turn and (
+        first or tool or event in {"UserPromptSubmit", "Stop", "SessionEnd"}
+    )
+    email = git_email(payload.get("cwd")) if turn else None
+    facts = None
+    if observe:
+        salt = db.execute("SELECT salt FROM install WHERE id=1").fetchone()[0]
+        facts = git_facts(payload.get("cwd"), salt)
+    with write(db):
+        db.execute(
+            "INSERT OR IGNORE INTO sessions(agent,session,home) VALUES (?,?,?)",
+            (name, session, home),
+        )
+        if version:
+            db.execute("INSERT OR REPLACE INTO versions_at VALUES (?,?,?,?)", (name, session, now, version))
+            db.execute("INSERT OR REPLACE INTO cli_versions VALUES (?,?,?)", (name, session, version))
+        if turn:
+            changes = {"first_seen_ns": now, "first_source": event}
+            if model:
+                db.execute("INSERT OR IGNORE INTO turn_models VALUES (?,?,?,?)", (*key, model))
+                changes["models"] = [r[0] for r in db.execute(
+                    "SELECT model FROM turn_models WHERE agent=? AND session=? AND turn=? ORDER BY model", key)]
+            if email is not None and email != observed_email(db, key, now):
+                db.execute(
+                    "INSERT OR REPLACE INTO git_identity VALUES (?,?,?,?,?)",
+                    (*key, now, email),
+                )
+                changes["identity_observed_ns"] = now
+            if event == "UserPromptSubmit":
+                changes["started_ns"] = now
+            if event in ("Stop", "SessionEnd"):
+                changes["ended_ns"] = now
+            if agent.child_owner_field and session != payload.get("session_id"):
+                parent = identifier(payload.get("session_id"))
+                if parent:
+                    changes["parent_session"] = parent
+            snapshot(
+                db,
+                key,
+                facts=facts,
+                changes=changes,
+                timestamp=now,
+            )
+            if event == "PostModelRequest":
+                correlation(
+                    db,
+                    key,
+                    payload.get("token_usage"),
+                    "model_hook",
+                    timestamp=now,
+                    status=payload.get("status", "unknown"),
+                    model=identifier(payload.get("model")),
+                )
+        if event in {"SessionStart", "Stop", "SessionEnd"}:
+            schedule_recovery(db, "*" if event == "SessionStart" else session)
+    if turn and event == "UserPromptSubmit":
+        command = shlex.join(
+            [
+                "env",
+                "CODEX_HOME=" + str(HOME),
+                sys.executable,
+                "-I",
+                str(HOME / "vantage/hooks/run_vantage_codex_hook.py"),
+                "tag",
+                name,
+                session,
+                turn,
+            ]
+        )
+        message = f"When PR, ticket, or purpose is known, use {command} --set name=value --source inferred for this turn."
+        classifier = Path(
+            os.environ.get(
+                "VANTAGE_CLASSIFIER_FILE", Path(home) / "vantage/classifier.md"
+            )
+        ).expanduser()
+        if classifier.is_file():
+            message = (
+                f"Read the Vantage classifier at {shlex.quote(str(classifier))}. "
+                f"Apply its dimensions to this turn with {command} --source inferred "
+                "--tag key=value (repeat for additional dimensions)."
+            )
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": message,
+                    }
+                }
+            )
+        )
+    launch(db)
+
+
+def main():
+    global SOURCE
+    os.umask(0o077)
+    try:
+        load_connection()
+    except (OSError, ValueError, KeyError):
+        if len(sys.argv) == 1:
+            return
+        raise SystemExit("Run Vantage telemetry setup first.")
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("hook").add_argument("agent", choices=AGENTS)
+    tag = sub.add_parser("tag")
+    tag.add_argument("agent", choices=AGENTS)
+    tag.add_argument("session")
+    tag.add_argument("turn")
+    tag.add_argument(
+        "--source", choices=["manual", "inferred", "explicit"], default="manual"
+    )
+    group = tag.add_mutually_exclusive_group(required=True)
+    group.add_argument("--set", "--tag", action="append", metavar="NAME=VALUE")
+    group.add_argument("--clear", metavar="NAME")
+    for action in ("recover", "flush", "status"):
+        sub.add_parser(action).add_argument("--binding")
+    sender = sub.add_parser("send")
+    sender.add_argument("--lock-fd", type=int, required=True)
+    sender.add_argument("--binding", required=True)
+    args = parser.parse_args(sys.argv[1:] or ["hook", "codex"])
+    if getattr(args, "binding", None) and args.binding != STATE.name:
+        return
+    if args.action == "hook":
+        # Coding clients must be able to continue even if capture is unavailable.
+        try:
+            db = connect()
+            try:
+                handle(db, args.agent, json.load(sys.stdin))
+            finally:
+                db.close()
+        except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error, subprocess.SubprocessError) as err:
+            print(f"Vantage hook skipped ({type(err).__name__})", file=sys.stderr)
+        return
+    db = connect()
+    try:
+        if args.action == "tag":
+            key = (args.agent, args.session, args.turn)
+            tags = {}
+            for assignment in args.set or [args.clear]:
+                name, sep, value = assignment.partition("=")
+                if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", name):
+                    parser.error("invalid classifier dimension name")
+                if args.clear and sep:
+                    parser.error("--clear expects a dimension name")
+                if args.set and (
+                    not sep
+                    or not 1 <= len(value) <= 512
+                    or any(ord(c) < 32 or ord(c) == 127 for c in value)
+                ):
+                    parser.error("invalid classifier value")
+                tags[name] = value if args.set else None
+            with write(db):
+                row = db.execute(
+                    "SELECT state FROM turns WHERE agent=? AND session=? AND turn=?",
+                    key,
+                ).fetchone()
+                if not row:
+                    parser.error("unknown turn")
+                if args.set and len(set(json.loads(row[0])["tags"]) | tags.keys()) > 32:
+                    parser.error("at most 32 dimensions per turn")
+                snapshot(db, key, tags=tags, tag_source=args.source)
+            launch(db, False, force=True)
+        elif args.action == "status":
+            for table in ("sessions", "turns", "outbox"):
+                print(table, db.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            failures, retry_at, last_ack = db.execute("SELECT failures,retry_at,last_ack FROM sender").fetchone()
+            print("consecutive_send_failures", failures)
+            print("retry_in_seconds", max(0, round(retry_at-time.time())))
+            print("last_ack_unix_seconds", int(last_ack))
+            print("pending_recoveries", db.execute("SELECT count(*) FROM recovery_queue").fetchone()[0])
+            for name, count in db.execute("SELECT name,count FROM diagnostics"):
+                print(name, count)
+        else:
+            SOURCE = "rollout"
+            if args.action == "send":
+                with os.fdopen(args.lock_fd, "a") as lock:
+                    run_sender(db, lock)
+            else:
+                launch(db, args.action == "recover", foreground=True, force=True)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["tag"]:
-        raise SystemExit(tag(sys.argv[2:]))
-    run()
+    main()
