@@ -63,3 +63,42 @@ so its real-time AI sources share one classifier. Classifiers may define custom 
 dimensions; hooks send them under the `vantage.classification.*` namespace without
 interpreting their meaning. Removing Vantage telemetry removes
 the managed hooks, launcher, classifier credential, and cached classifier.
+
+### Opt-in Codex staging attribution pilot (macOS or Linux)
+
+Use a dedicated Codex home for the staging integration. The installer prompts
+locally for its Codex ingest token and checks an empty authenticated OTLP/gRPC
+export over verified TLS. It requires Python 3.9+ and curl built with HTTP/2.
+Run these commands from the plugin checkout:
+
+```sh
+export CODEX_HOME="$HOME/.codex-vantage-staging"
+./bin/install-local
+python3 plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py --staging
+codex
+```
+
+Trust the hooks in Codex, restart it, then use a multi-turn conversation.
+If the account supplies a classifier, place its Markdown at
+`$CODEX_HOME/vantage/classifier.md`. Each prompt gets a command scoped to
+its turn. A later tag or Git observation writes a new complete snapshot.
+
+Native usage goes through the configured Codex exporter. Hooks synchronously
+write turn state and request fingerprints to a private SQLite outbox under
+`$CODEX_HOME/vantage/outbox`. A detached worker sends batches to the same
+staging integration using gRPC and removes them on acknowledgement. Stop,
+SessionStart and SessionEnd trigger recovery from local Codex rollouts,
+including eligible post-install UUIDv7 threads without a registered hook.
+Recovery needs a local rollout and a later trigger. Request rows carry token
+fingerprints for correlation. Billing continues to use native usage.
+
+From the same home, inspect pending counts, retry, or remove the pilot:
+
+```sh
+python3 -I "$CODEX_HOME/vantage/hooks/run_vantage_codex_hook.py" status
+python3 -I "$CODEX_HOME/vantage/hooks/run_vantage_codex_hook.py" recover
+python3 plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py --remove
+```
+
+Removal deletes the managed hooks, exporter and credential. SQLite history
+remains local. Use a separate home per staging integration.

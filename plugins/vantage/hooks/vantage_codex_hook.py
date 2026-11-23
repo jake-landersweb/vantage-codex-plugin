@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "1"
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.5.0"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 EVENT_NAME = "codex.turn.attribution"
 DEFAULT_ENDPOINT = "https://ingest.vantage.sh"

@@ -38,6 +38,26 @@ class Response:
 
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
+    def test_staging_lifecycle(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            path = pathlib.Path(home)
+            hooks = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-hook"}]}]}}
+            MODULE.write_user_hooks(hooks)
+            with mock.patch("runpy.run_path", return_value={"export": mock.Mock()}), mock.patch("getpass.getpass", return_value="fake-staging"), mock.patch.object(sys, "argv", ["setup", "--staging"]):
+                self.assertEqual(MODULE.main(), 0)
+                first = MODULE.pilot_profile().read_bytes()
+                self.assertEqual(MODULE.main(), 0)
+                self.assertEqual(MODULE.pilot_profile().read_bytes(), first)
+                self.assertIn(MODULE.STAGING, (path / "config.toml").read_text())
+                events = MODULE.load_user_hooks()["hooks"]
+                self.assertEqual(set(events), set(MODULE.PILOT_EVENTS))
+                self.assertEqual(len(events["Stop"]), 2)
+            with mock.patch.object(sys, "argv", ["setup", "--remove"]):
+                self.assertEqual(MODULE.main(), 0)
+            self.assertEqual(MODULE.load_user_hooks(), hooks)
+            self.assertFalse(MODULE.pilot_profile().exists())
+            self.assertNotIn(MODULE.STAGING, (path / "config.toml").read_text())
+
     def setup_payload(self, ingest_token="secret-token"):
         return {
             "plaintext_token": ingest_token,

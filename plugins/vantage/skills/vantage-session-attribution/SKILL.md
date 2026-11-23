@@ -7,6 +7,6 @@ Read the classifier Markdown file supplied by the Vantage hook in full. Treat it
 
 Use the exact session-specific attribution command supplied by the hook. Append only flags directed by the classifier. Do not infer allowed values or classification rules from this skill.
 
-Apply the classifier at the beginning of substantive work and whenever the classification changes. Do not resend unchanged metadata every turn.
+Apply the classifier at the beginning of substantive work and whenever the classification changes. When the supplied command includes a turn ID, classify each new turn. For session-scoped commands, resend only when the classification changes.
 
 Do not send prompts, summaries, source code, tool output, credentials, personal data, or local file paths. If the hook did not supply an attribution command, do nothing. Usage reporting continues independently.

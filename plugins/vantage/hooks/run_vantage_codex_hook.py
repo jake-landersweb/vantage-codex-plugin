@@ -83,8 +83,12 @@ def newest_hook(env=os.environ):
 
 
 def main():
-    hook = newest_hook()
-    if hook is None:
+    home = pathlib.Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+    if (home / "vantage/staging-attribution.json").is_file():
+        hook = home / "vantage/hooks/pilot_attribution.py"
+    else:
+        hook = newest_hook()
+    if hook is None or not hook.is_file():
         return 0
     runpy.run_path(str(hook), run_name="__main__")
     return 0

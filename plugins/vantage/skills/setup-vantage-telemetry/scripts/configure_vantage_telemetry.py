@@ -29,7 +29,7 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.5.0"
 USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
@@ -217,10 +217,19 @@ def copy_managed_hook_scripts():
         write_file(destination / name, source.read_bytes(), mode=0o700)
 
 
-def install_user_hooks():
+BASE_EVENTS = ("SessionStart", "Stop")
+PILOT_EVENTS = BASE_EVENTS + ("UserPromptSubmit", "PostModelRequest", "SubagentStart", "PreToolUse", "PostToolUse", "SessionEnd")
+STAGING = "https://ingest-staging.vantage.sh"
+
+
+def pilot_profile():
+    return classifier_directory() / "staging-attribution.json"
+
+
+def install_user_hooks(events=BASE_EVENTS):
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
-    for event_name in ("SessionStart", "Stop"):
+    for event_name in events:
         groups, _changed = remove_managed_hook_handlers(hooks.get(event_name, []))
         groups.append({"hooks": [hook_handler(event_name)]})
         hooks[event_name] = groups
@@ -254,7 +263,7 @@ def remove_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
     changed = False
-    for event_name in ("SessionStart", "Stop"):
+    for event_name in PILOT_EVENTS:
         if event_name not in hooks:
             continue
         groups, event_changed = remove_managed_hook_handlers(hooks[event_name])
@@ -373,13 +382,13 @@ def remove_managed_settings(lines):
     return result
 
 
-def managed_block(token, include_environment):
+def managed_block(token, include_environment, *, endpoint=None, environment="prod"):
     lines = [BEGIN]
     if include_environment:
-        lines.append('environment = "prod"')
+        lines.append('environment = "%s"' % environment)
     lines += [
         'exporter = { otlp-http = { endpoint = "%s", protocol = "binary", headers = { authorization = "Bearer %s" } } }'
-        % (INGEST_ENDPOINT, token),
+        % (endpoint or INGEST_ENDPOINT, token),
         "log_user_prompt = false",
         "log_agent_responses = false",
         "log_guardian_assessments = false",
@@ -525,9 +534,44 @@ def print_next_steps():
     print("3. Start a new conversation.")
 
 
+def install_staging(lines, configured, otel_header, has_environment, conflicts):
+    # The home is the consent boundary for discovery of post-install rollouts.
+    if not os.environ.get("CODEX_HOME") or codex_home_path().resolve() == (pathlib.Path.home() / ".codex").resolve():
+        raise ValueError("set CODEX_HOME to a dedicated staging home")
+    profile = pilot_profile()
+    if conflicts or (configured and not profile.exists()):
+        raise ValueError("this home already has another exporter")
+    if profile.exists():
+        settings = json.loads(profile.read_text())
+    else:
+        import getpass
+        token = getpass.getpass("Staging Codex ingest token: ")
+        if not TOKEN.fullmatch('authorization = "Bearer %s"' % token):
+            raise ValueError("invalid token")
+        settings = {"token": token, "since_ns": time.time_ns()}
+    token = settings["token"]
+    # Preflight the same authenticated gRPC route that the worker uses.
+    import runpy
+    sender = runpy.run_path(str(BUNDLED_HOOKS_DIR / "pilot_attribution.py"))
+    sender["export"]("vantage-agent-hook", [], token=token)
+    block = managed_block(token, not has_environment, endpoint=STAGING + "/v1/logs", environment="staging")
+    if otel_header is None:
+        lines += ([""] if lines else []) + ["[otel]"] + block
+    else:
+        lines[otel_header + 1:otel_header + 1] = block
+    load_user_hooks()
+    write_file(managed_hooks_dir() / "pilot_attribution.py", (BUNDLED_HOOKS_DIR / "pilot_attribution.py").read_bytes(), mode=0o700)
+    write_file(profile, json.dumps(settings).encode())
+    write_config(config_path(), lines)
+    install_user_hooks(PILOT_EVENTS)
+    print_next_steps()
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remove", action="store_true", help="remove the Vantage-managed block")
+    parser.add_argument("--staging", action="store_true", help="install the attribution pilot in a dedicated Codex home")
     args = parser.parse_args()
 
     path = config_path()
@@ -548,6 +592,8 @@ def main():
     if args.remove:
         try:
             removed_hooks = remove_user_hooks()
+            pilot_profile().unlink(missing_ok=True)
+            (managed_hooks_dir() / "pilot_attribution.py").unlink(missing_ok=True)
             removed_classifier = remove_classifier_files()
         except (OSError, UnicodeError, ValueError) as error:
             print("Could not remove Vantage files safely: %s" % error, file=sys.stderr)
@@ -570,6 +616,16 @@ def main():
         write_config(path, lines)
         print("Removed Vantage telemetry from %s. Restart Codex to apply." % path)
         return 0
+
+    if args.staging:
+        try:
+            return install_staging(lines, configured, otel_header, has_environment, conflicts)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            print("Staging setup failed (%s)." % type(error).__name__, file=sys.stderr)
+            return 2
+    if pilot_profile().exists():
+        print("Use --staging to update this pilot installation.", file=sys.stderr)
+        return 2
 
     if configured:
         if not classifier_token_path().is_file() or not classifier_markdown_path().is_file():
