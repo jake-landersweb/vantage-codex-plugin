@@ -2,6 +2,7 @@
 """Dependency-free local MCP tools for Vantage telemetry setup."""
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -349,8 +350,9 @@ def set_turn_attribution(arguments):
         if not 1 <= len(value) <= 512 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise ValueError("invalid classifier value")
         assignments.append(f"{key}={value}")
-    # Use the bundled writer so validation, replacement and delivery share the CLI transaction.
-    command = [sys.executable, "-I", str(PLUGIN_ROOT / "hooks/vantage_codex_hook.py"),
+    codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+    launcher = codex_home / "vantage" / "hooks" / "run_vantage_codex_hook.py"
+    command = [sys.executable, "-I", str(launcher),
                "tag", "codex", *ids, "--source", "inferred", "--replace", *assignments]
     try:
         completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)

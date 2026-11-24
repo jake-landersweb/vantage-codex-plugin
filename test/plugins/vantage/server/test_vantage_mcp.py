@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -164,9 +165,24 @@ class VantageMcpTest(unittest.TestCase):
                 "tag", "codex", "s", "t", "--source", "inferred", "--replace", *assignments,
             ])
 
-    def test_mcp_writes_only_an_existing_turn_in_the_configured_outbox(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, CODEX_HOME=tmp):
-            vantage = pathlib.Path(tmp) / "vantage"
+    def test_mcp_uses_the_same_installed_hook_that_created_the_turn(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, CODEX_HOME=tmp, VANTAGE_CODEX_PLUGIN_ROOT=""
+        ):
+            home = pathlib.Path(tmp)
+            vantage = home / "vantage"
+            plugin_hooks = MODULE.PLUGIN_ROOT / "hooks"
+            launcher = vantage / "hooks" / "run_vantage_codex_hook.py"
+            launcher.parent.mkdir(parents=True)
+            shutil.copyfile(plugin_hooks / launcher.name, launcher)
+            cache = home / "plugins" / "cache" / "vantage-codex-plugin" / "vantage"
+            older, newer = cache / "older", cache / "newer"
+            for root, version in ((older, "0.5.0"), (newer, "0.5.1")):
+                (root / "hooks").mkdir(parents=True)
+                (root / "plugin.json").write_text(json.dumps({"version": version}))
+            writer = "vantage_codex_hook.py"
+            (older / "hooks" / writer).write_text("raise SystemExit('stale hook')\n")
+            shutil.copyfile(plugin_hooks / writer, newer / "hooks" / writer)
             endpoint, token = "http://127.0.0.1:1", "fixture-token"
             binding = hashlib.sha256((endpoint + "\0" + token).encode()).hexdigest()
             outbox = vantage / "outbox" / binding
@@ -175,9 +191,9 @@ class VantageMcpTest(unittest.TestCase):
                 "endpoint": endpoint, "token": token, "since_ns": 1,
             }))
             # Keep the test offline while exercising the same hook and writer as the server.
-            with (outbox / "worker.lock").open("a") as lock:
+            with (outbox / "worker.lock").open("a") as lock, mock.patch.object(MODULE, "PLUGIN_ROOT", older):
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                subprocess.run([sys.executable, "-I", str(MODULE.PLUGIN_ROOT / "hooks/vantage_codex_hook.py")],
+                subprocess.run([sys.executable, "-I", str(launcher)],
                                input=json.dumps({"hook_event_name": "UserPromptSubmit",
                                                  "session_id": "s", "turn_id": "t"}),
                                capture_output=True, text=True, check=True)

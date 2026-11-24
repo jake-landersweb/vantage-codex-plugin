@@ -211,6 +211,15 @@ class VantageCodexHookTest(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertEqual("", result.stderr)
 
+        command = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT.parent / "run_vantage_codex_hook.py"), "tag"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, command.returncode)
+
     def test_launcher_ignores_pythonpath_modules(self):
         injected_modules = self.directory / "injected-modules"
         injected_modules.mkdir()

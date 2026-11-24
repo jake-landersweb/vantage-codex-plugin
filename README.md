@@ -49,8 +49,8 @@ a branch preserve the classification. Detached checkouts use the commit, and
 outside Git the hook uses the working directory. A task change in the same
 checkout can override inherited tags with the plugin’s `set_turn_attribution` MCP tool.
 An unchanged follow-up requires no classifier read or tool call from the agent.
-The tool writes through the local plugin. Codex can ask for approval for this
-write. For unattended runs, authorize `vantage_local.set_turn_attribution`
+The tool writes through the same launcher that handles hook events. Codex can
+ask for approval for this write. For unattended runs, authorize `vantage_local.set_turn_attribution`
 in the host's tool approval settings before starting the session. When the host
 blocks the tool, new classifier tags cannot be saved.
 

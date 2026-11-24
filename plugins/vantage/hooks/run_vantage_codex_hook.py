@@ -86,7 +86,7 @@ def newest_hook(env=os.environ):
 def main():
     hook = newest_hook()
     if hook is None:
-        return 0
+        return 1 if sys.argv[1:] else 0
     runpy.run_path(str(hook), run_name="__main__")
     return 0
 
