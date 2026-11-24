@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Vantage Codex attribution hook. Run directly with Python 3.9+.
-SQLite captures evidence. A detached copy of this script exports OTLP/gRPC.
+SQLite captures evidence. A detached copy of this script exports OTLP logs.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import argparse
 import datetime
 import errno
 import hashlib
+import http.client
 import json
 import os
 from functools import lru_cache
@@ -818,6 +819,32 @@ def require_ack(headers, frame):
 
 def export(service, records, *, token=None, endpoint=None):
     body = encode_logs(service, records)
+    if os.name == "nt":
+        request = urllib.request.Request(
+            f"{endpoint or ENDPOINT}/v1/logs",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token or TOKEN}",
+                "Content-Type": "application/x-protobuf",
+                "User-Agent": USER_AGENT,
+            },
+        )
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        try:
+            with opener.open(request, timeout=5) as response:
+                if response.status != 200 or response.headers.get_content_type() != "application/x-protobuf":
+                    raise RuntimeError("collector did not acknowledge the HTTP export")
+                # Only the empty response and the Collector's empty partial_success are full ACKs.
+                ack = response.read(3)
+                if response.length not in (None, 0) or ack not in (b"", b"\x0a\x00"):
+                    raise RuntimeError("collector returned a partial or unrecognized response; batch retained")
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise RuntimeError(f"collector returned HTTP {error.code}; batch retained") from error
+        except http.client.HTTPException as error:
+            raise RuntimeError("incomplete HTTP export response; batch retained") from error
+        return
+
     frame = b"\x00" + struct.pack(">I", len(body)) + body
     url = f"{endpoint or ENDPOINT}/opentelemetry.proto.collector.logs.v1.LogsService/Export"
     # Keep the credential in stdin. curl writes HTTP/2 trailers with the headers.
@@ -826,7 +853,7 @@ def export(service, records, *, token=None, endpoint=None):
         (directory / "request.bin").write_bytes(frame)
         auth = f"authorization: Bearer {token or TOKEN}\n".encode()
         args = [
-            os.environ.get("VANTAGE_CODEX_CURL") or ("curl.exe" if os.name == "nt" else "curl"),
+            os.environ.get("VANTAGE_CODEX_CURL") or "curl",
             "--disable",
             "--silent",
             "--show-error",

@@ -38,8 +38,9 @@ the updated hooks to apply the shell and edit tool filter.
 The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
-TLS and OTLP/gRPC. Setup requires Python 3.9+ with SQLite and TLS 1.3 support,
-and curl with HTTP/2 support.
+TLS with OTLP/HTTP on Windows and OTLP/gRPC elsewhere. Setup requires
+Python 3.9+ with SQLite and TLS 1.3 support on all platforms. The gRPC
+sender also requires curl with HTTP/2 support.
 
 On macOS, the MCP server checks common Homebrew and python.org locations
 when the default Python lacks TLS 1.3. The hook launcher uses `python3` from
@@ -51,10 +52,7 @@ On Windows, use the [Python Install Manager](https://docs.python.org/3/using/win
 and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
 server and installed Windows hooks use the same `python3` command.
 If `python3` opens the Microsoft Store, check that the Python Install Manager
-is installed and its app execution aliases are enabled. Check that
-`curl.exe --version` lists `HTTP2` under Features. If the bundled Windows curl
-lacks HTTP/2, install an [HTTP/2-enabled curl build](https://curl.se/windows/),
-set `VANTAGE_CODEX_CURL` to its full executable path, and restart Codex.
+is installed and its app execution aliases are enabled.
 Keep `CODEX_HOME` in a private directory in your Windows user profile so
 credentials inherit its access permissions.
 

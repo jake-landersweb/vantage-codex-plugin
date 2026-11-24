@@ -124,7 +124,7 @@ def outcome_from_completed(action, completed):
         return SetupOutcome(
             "missing_requirements",
             "Vantage telemetry can't be set up until these are installed: %s "
-            "Then run setup again." % (steps or "- Check that Python 3.9+ and curl with HTTP/2 are installed."),
+            "Then run setup again." % (steps or "- Check that Python 3.9+ is installed with SQLite and TLS 1.3 support."),
             False,
             True,
         )

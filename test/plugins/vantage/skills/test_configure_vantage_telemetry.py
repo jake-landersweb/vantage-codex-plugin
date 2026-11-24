@@ -573,15 +573,12 @@ class RequirementChecksTest(unittest.TestCase):
         )
         self.assertEqual(["curl_http2"], problems)
 
-    def test_windows_checks_the_configured_curl(self):
-        executable = r"C:\Tools\curl.exe"
-        which = mock.Mock(return_value=executable)
-        run = self.curl_version("HTTP2")
-        with mock.patch.dict(os.environ, VANTAGE_CODEX_CURL=executable):
-            problems = MODULE.requirement_problems(version=(3, 11), os_name="nt", which=which, run=run)
-        self.assertEqual([], problems)
-        which.assert_called_once_with(executable)
-        self.assertEqual([executable, "-V"], run.call_args.args[0])
+    def test_windows_skips_curl_check(self):
+        which = mock.Mock()
+        run = mock.Mock()
+        self.assertEqual([], MODULE.requirement_problems(version=(3, 11), os_name="nt", which=which, run=run))
+        which.assert_not_called()
+        run.assert_not_called()
 
     def test_git_warning_uses_version_and_handles_missing_git(self):
         for stdout, expected in [
