@@ -30,8 +30,6 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console-staging.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.5.0"
-USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
@@ -49,6 +47,13 @@ OTEL_TABLE = re.compile(r"^\s*\[\s*otel\s*\]\s*(?:#.*)?$")
 OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
+try:
+    PLUGIN_VERSION = json.loads((PLUGIN_ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+except (OSError, ValueError, TypeError, KeyError):
+    PLUGIN_VERSION = "unknown"
+if not isinstance(PLUGIN_VERSION, str) or not PLUGIN_VERSION:
+    PLUGIN_VERSION = "unknown"
+USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 
@@ -93,7 +98,7 @@ def hook_handler(event_name):
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["py", "-3", "-I", str(python_script)]),
+        "commandWindows": subprocess.list2cmdline(["python3", "-I", str(python_script)]),
         "timeout": 3 if event_name == "SessionEnd" else 30,
         "statusMessage": (
             "Loading Vantage attribution"
@@ -110,12 +115,14 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
-    legacy_windows = subprocess.list2cmdline([
-        "python", "-I", str(managed_hooks_dir() / "run_vantage_codex_hook.py"),
-    ])
+    python_script = str(managed_hooks_dir() / "run_vantage_codex_hook.py")
+    legacy_windows = (
+        subprocess.list2cmdline(["python", "-I", python_script]),
+        subprocess.list2cmdline(["py", "-3", "-I", python_script]),
+    )
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows") in (expected["commandWindows"], legacy_windows)
+        or handler.get("commandWindows") in (expected["commandWindows"], *legacy_windows)
     )
 
 

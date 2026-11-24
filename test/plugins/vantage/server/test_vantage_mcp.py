@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import runpy
 import shutil
 import sqlite3
 import subprocess
@@ -17,14 +18,13 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 PLUGIN_ROOT = ROOT / "plugins/vantage"
 SCRIPT = PLUGIN_ROOT / "server/vantage_mcp.py"
-LAUNCHER = SCRIPT.with_name("run_vantage_mcp.sh")
 MCP_SERVER = json.loads((PLUGIN_ROOT / "mcp.json").read_text(encoding="utf-8"))["mcpServers"]["vantage_local"]
 SPEC = importlib.util.spec_from_file_location("vantage_mcp", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 sys.path.insert(0, str(ROOT / "plugins/vantage/hooks"))
-from vantage_codex_hook import try_lock
+from vantage_codex_hook import PLUGIN_VERSION as HOOK_VERSION, try_lock
 
 
 def request(message_id, method, params=None):
@@ -102,7 +102,7 @@ class VantageMcpTest(unittest.TestCase):
         )
         self.assertIn("set_turn_attribution", {tool["name"] for tool in responses[1]["result"]["tools"]})
 
-    def test_launcher_reports_a_missing_python_interpreter(self):
+    def test_mcp_reports_a_missing_python_override(self):
         environment = os.environ.copy()
         environment.pop("PLUGIN_ROOT", None)
         environment.update(
@@ -111,22 +111,13 @@ class VantageMcpTest(unittest.TestCase):
             }
         )
 
-        commands = [([sys.executable, "-I", str(SCRIPT)], "VANTAGE_CODEX_PYTHON")]
-        if os.name != "nt":
-            commands.append((["sh", str(LAUNCHER)], "requires Python 3"))
-        for command, message in commands:
-            with self.subTest(command=command):
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    check=False,
-                    env=environment,
-                    text=True,
-                    timeout=5,
-                )
-                self.assertEqual(4, completed.returncode)
-                self.assertEqual("", completed.stdout)
-                self.assertIn(message, completed.stderr)
+        completed = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT)],
+            capture_output=True, check=False, env=environment, text=True, timeout=5,
+        )
+        self.assertEqual(4, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("VANTAGE_CODEX_PYTHON", completed.stderr)
 
     def test_negotiates_legacy_protocol_and_lists_deterministic_tools(self):
         messages = [
@@ -214,6 +205,29 @@ class VantageMcpTest(unittest.TestCase):
                     self.assertEqual(len(rows), 1)
                     if success:
                         self.assertEqual(json.loads(rows[0][0])["tags"], tags)
+                    else:
+                        self.assertIn("could not find that turn", result["content"][0]["text"])
+                (vantage / "connection.json").unlink()
+                result = MODULE.set_turn_attribution({"session_id": "s", "turn_id": "t", "tags": {}})
+                self.assertTrue(result["isError"])
+                self.assertIn("Set up Vantage telemetry", result["content"][0]["text"])
+                with closing(sqlite3.connect(outbox / "state.sqlite")) as db:
+                    versions = {
+                        json.loads(payload)["vantage.plugin.version"]
+                        for (payload,) in db.execute("SELECT payload FROM outbox")
+                    }
+                self.assertEqual(versions, {"0.5.1"})
+
+    def test_attribution_error_does_not_expose_subprocess_output(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, CODEX_HOME=tmp):
+            launcher = pathlib.Path(tmp) / "vantage/hooks/run_vantage_codex_hook.py"
+            launcher.parent.mkdir(parents=True)
+            launcher.touch()
+            completed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"private telemetry details")
+            with mock.patch.object(subprocess, "run", return_value=completed):
+                result = MODULE.set_turn_attribution({"session_id": "s", "turn_id": "t", "tags": {}})
+            self.assertTrue(result["isError"])
+            self.assertNotIn("private telemetry details", result["content"][0]["text"])
 
     def test_set_turn_attribution_rejects_invalid_arguments_before_writing(self):
         valid = {"session_id": "s", "turn_id": "t", "tags": {}}
@@ -538,17 +552,10 @@ class VantageMcpTest(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "plugins/vantage/plugin.json").read_text(encoding="utf-8")
         )
-        hook = (ROOT / "plugins/vantage/hooks/vantage_codex_hook.py").read_text(
-            encoding="utf-8"
-        )
-        setup = (
-            ROOT
-            / "plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
-        ).read_text(encoding="utf-8")
-
-        expected = 'PLUGIN_VERSION = "%s"' % manifest["version"]
-        self.assertIn(expected, hook)
-        self.assertIn(expected, setup)
+        setup = runpy.run_path(str(MODULE.SETUP_SCRIPT))
+        self.assertEqual(manifest["version"], HOOK_VERSION)
+        self.assertEqual(manifest["version"], setup["PLUGIN_VERSION"])
+        self.assertEqual(manifest["version"], MODULE.plugin_version())
 
         self.assertEqual("stdio", MCP_SERVER["type"])
         self.assertEqual("python3", MCP_SERVER["command"])

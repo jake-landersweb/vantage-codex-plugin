@@ -250,15 +250,15 @@ def git_observation(db, cwd, salt, *, observe=True):
     else:
         # Git still resolves the commit, including packed refs and linked worktrees.
         result = run_git(
-            cwd, "rev-parse", "--path-format=absolute", "--absolute-git-dir",
+            cwd, "rev-parse", "--absolute-git-dir",
             "--git-common-dir", "HEAD", "--symbolic-full-name", "HEAD",
         )
         fields = result.stdout.splitlines() if result else []
-        if len(fields) < 2 or not all(os.path.isabs(path) for path in fields[:2]):
+        if len(fields) < 2 or not os.path.isabs(fields[0]) or not fields[1]:
             return {}, git_config(cwd)[0]
         git_dir, common_dir = fields[:2]
         try:
-            if layout != (Path(git_dir).resolve(), Path(common_dir).resolve()):
+            if layout != (Path(git_dir).resolve(), (Path(cwd) / common_dir).resolve()):
                 layout = head_stamp = config_stamp = None
         except (OSError, RuntimeError):
             layout = head_stamp = config_stamp = None
@@ -311,7 +311,13 @@ def git_observation(db, cwd, salt, *, observe=True):
 REQUEST = "vantage.request_correlation"
 TURN = "vantage.turn_attribution"
 HOME = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser().resolve()
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_MANIFEST = Path(__file__).resolve().parents[1] / "plugin.json"
+try:
+    PLUGIN_VERSION = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))["version"]
+except (OSError, ValueError, TypeError, KeyError):
+    PLUGIN_VERSION = "unknown"
+if not isinstance(PLUGIN_VERSION, str) or not PLUGIN_VERSION:
+    PLUGIN_VERSION = "unknown"
 USER_AGENT = f"vantage-codex-plugin/{PLUGIN_VERSION}"
 DEFAULT_CLASSIFIER_ENDPOINT = "https://api.staging.vantage.sh/plugins/classifier"
 MAX_CLASSIFIER_BYTES = 64 * 1024

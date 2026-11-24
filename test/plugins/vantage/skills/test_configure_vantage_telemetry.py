@@ -372,8 +372,11 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     "hooks": [{"type": "command", "commandWindows": legacy_windows}],
                 }]
                 previous["hooks"]["PostToolUse"].append({"hooks": [MODULE.hook_handler("PostToolUse")]})
+                legacy_py = MODULE.subprocess.list2cmdline([
+                    "py", "-3", "-I", str(MODULE.managed_hooks_dir() / "run_vantage_codex_hook.py"),
+                ])
                 previous["hooks"]["SessionEnd"] = [{
-                    "hooks": [dict(MODULE.hook_handler("SessionEnd"), timeout=30)],
+                    "hooks": [{"type": "command", "commandWindows": legacy_py, "timeout": 30}],
                 }]
                 hooks_path.write_text(json.dumps(previous), encoding="utf-8")
                 MODULE.install_user_hooks()
@@ -388,7 +391,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                 self.assertRegex("Bash", matcher)
                 self.assertRegex("apply_patch", matcher)
                 self.assertNotRegex("mcp__example__read", matcher)
-                self.assertTrue(payload["hooks"]["PostToolUse"][-1]["hooks"][0]["commandWindows"].startswith("py -3 -I "))
+                self.assertTrue(payload["hooks"]["PostToolUse"][-1]["hooks"][0]["commandWindows"].startswith("python3 -I "))
                 self.assertEqual("echo start", payload["hooks"]["SessionStart"][0]["hooks"][0]["command"])
                 for event_name in MODULE.HOOK_EVENTS:
                     managed = [
@@ -400,6 +403,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     self.assertEqual(1, len(managed))
                     if event_name == "SessionEnd":
                         self.assertEqual(3, managed[0]["timeout"])
+                        self.assertEqual(1, len(payload["hooks"][event_name]))
                 self.assertIn(
                     "run_vantage_codex_hook.py",
                     json.dumps(payload["hooks"]),

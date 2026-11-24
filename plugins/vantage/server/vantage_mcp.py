@@ -357,9 +357,24 @@ def set_turn_attribution(arguments):
     try:
         completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
         saved = completed.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        errors = completed.stderr.rstrip().splitlines()
+        last_error = errors[-1] if errors else b""
+    except subprocess.TimeoutExpired:
         saved = False
-    message = "Turn attribution saved." if saved else "Could not save attribution. Check the turn reference and local telemetry setup."
+        last_error = b"timeout"
+    except OSError:
+        saved = False
+        last_error = b""
+    if saved:
+        message = "Turn attribution saved."
+    elif last_error == b"unknown turn" or last_error.endswith(b": error: unknown turn"):
+        message = "Vantage could not find that turn. Use the session and turn IDs from the current Vantage hook."
+    elif last_error == b"timeout":
+        message = "Saving turn attribution timed out."
+    elif last_error in {b"Run Vantage telemetry setup first.", b"Vantage attribution hook is not installed."} or not launcher.is_file():
+        message = "Set up Vantage telemetry before saving attribution."
+    else:
+        message = "Could not save turn attribution. Check local telemetry setup."
     return {"content": [{"type": "text", "text": message}], "isError": not saved}
 
 

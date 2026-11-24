@@ -183,6 +183,13 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("git.user.name", self.payloads()[-1])
 
     def test_post_tool_observes_git_changes_without_spawning_git_for_stable_refs(self):
+        git_environment = patch.dict(
+            os.environ,
+            {key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            clear=True,
+        )
+        git_environment.start()
+        self.addCleanup(git_environment.stop)
         repo = self.root / "repo"
         tree = self.root / "worktree"
 
@@ -228,6 +235,28 @@ class HookTest(unittest.TestCase):
         self.assertEqual({fact["repository"] for fact in facts}, {"example.invalid/test/project"})
         self.assertIs(facts[1]["branch_is_default"], False)
         self.assertIs(facts[2]["branch_is_default"], True)
+
+    def test_git_observation_resolves_relative_common_dir(self):
+        repo = self.root / "repo"
+        subdirectory = repo / "nested"
+        subdirectory.mkdir(parents=True)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", repo, *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("remote", "add", "origin", "git@example.invalid:test/project.git")
+        git("-c", "user.name=Test User", "-c", "user.email=git@example.invalid",
+            "commit", "-qm", "initial", "--allow-empty")
+        head = git("rev-parse", "HEAD")
+        salt = b"fixture"
+        root_facts, _ = store.git_observation(self.db, str(repo), salt)
+        self.db.execute("DELETE FROM git_worktrees")
+        nested_facts, _ = store.git_observation(self.db, str(subdirectory), salt)
+        self.assertEqual(root_facts, nested_facts)
+        self.assertEqual(head, root_facts["head"])
+        self.assertEqual("main", root_facts["branch"])
+        self.assertEqual("example.invalid/test/project", root_facts["repository"])
 
     def test_request_model_switch_survives_retry(self):
         p = {"session_id": "s", "turn_id": "t", "hook_event_name": "PostModelRequest",

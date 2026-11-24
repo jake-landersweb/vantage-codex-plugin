@@ -42,8 +42,8 @@ TLS and OTLP/gRPC. The bundled tools start with `python3` on `PATH` and require
 Python 3.9+ and curl with HTTP/2 support.
 
 On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
-and confirm that `python3 --version` and `py -3 --version` both run Python 3.9
-or newer. The MCP server uses `python3`, and the installed hooks use `py -3`.
+and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
+server and installed Windows hooks use the same `python3` command.
 If `python3` opens the Microsoft Store, check that the Python Install Manager
 is installed and its app execution aliases are enabled. Check that
 `curl.exe --version` lists `HTTP2` under Features. If the bundled Windows curl
