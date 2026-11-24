@@ -3,7 +3,9 @@ import io
 import os
 import datetime
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import threading
 import time
 import sys
 import subprocess
@@ -109,6 +111,57 @@ class HookTest(unittest.TestCase):
         ]:
             with self.subTest(head=head, frame=frame), self.assertRaises(RuntimeError):
                 store.require_ack(head, frame)
+
+    def test_windows_http_export_retires_only_acknowledged_batches(self):
+        requests = []
+
+        class Collector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append((self.path, self.headers["Authorization"], self.headers["Content-Type"],
+                                 self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(length))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        proto = "application/x-protobuf"
+        with HTTPServer(("127.0.0.1", 0), Collector) as server:
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                with patch.object(store, "os", wraps=os) as windows, patch.object(
+                    store, "ENDPOINT", endpoint
+                ), patch.object(store, "TOKEN", "fixture-token"):
+                    windows.name = "nt"
+                    for status, content_type, body, length, accepted in [
+                        (200, proto, b"\x0a\x02\x08\x01", 4, False),
+                        (200, proto, b"", 2, False),  # truncated ACK
+                        (200, "text/html", b"", 0, False),
+                        (204, proto, b"", 0, False),
+                        (503, proto, b"", 0, False),
+                        (200, proto, b"", 0, True),
+                        (200, proto, b"\x0a\x00", 2, True),
+                    ]:
+                        with self.subTest(status=status, body=body, length=length):
+                            if not self.payloads():
+                                store.enqueue(self.db, store.REQUEST, ("codex", "s", "t"), {"status": "completed"})
+                            timestamp, payload = self.db.execute("SELECT timestamp,payload FROM outbox").fetchone()
+                            expected = store.encode_logs("vantage-agent-hook", [(timestamp, json.loads(payload))])
+                            if accepted:
+                                drain(self.db)
+                            else:
+                                with self.assertRaises((RuntimeError, OSError)):
+                                    drain(self.db)
+                            self.assertEqual(bool(self.payloads()), not accepted)
+                            self.assertEqual(requests[-1], ("/v1/logs", "Bearer fixture-token", proto, expected))
+            finally:
+                server.shutdown()
+                worker.join()
 
     def test_first_model_request_belongs_to_child_and_tag_survives_stop(self):
         p = {

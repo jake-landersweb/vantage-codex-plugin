@@ -110,7 +110,9 @@ def requirement_problems(*, version=None, os_name=None, which=shutil.which, run=
         import sqlite3  # noqa: F401 - the attribution outbox needs it
     except ImportError:
         problems.append("sqlite")
-    curl = os.environ.get("VANTAGE_CODEX_CURL") or ("curl.exe" if os_name == "nt" else "curl")
+    if os_name == "nt":
+        return problems
+    curl = os.environ.get("VANTAGE_CODEX_CURL") or "curl"
     if not which(curl):
         problems.append("curl_missing")
     elif not curl_supports_http2(curl, run=run):
@@ -622,10 +624,7 @@ def verify_attribution_transport(token):
         hook["export"]("vantage-agent-hook", [], token=token,
                        endpoint=INGEST_ENDPOINT.removesuffix("/v1/logs").rstrip("/"))
     except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        message = "Could not verify the authenticated gRPC logs endpoint."
-        if os.name == "nt":
-            message += " Use an HTTP/2-enabled curl.exe and set VANTAGE_CODEX_CURL to its full path."
-        raise ValueError(message) from error
+        raise ValueError("Could not verify the authenticated attribution logs endpoint.") from error
 
 
 def verify_ingest_token(token):
