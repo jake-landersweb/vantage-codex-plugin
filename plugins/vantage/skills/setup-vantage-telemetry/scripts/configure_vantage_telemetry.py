@@ -12,6 +12,7 @@ import secrets
 import runpy
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -59,8 +60,14 @@ BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 MIN_PYTHON = (3, 9)
 MISSING_REQUIREMENTS_EXIT = 6
+TLS_ERROR_EXIT = 7
 REQUIREMENT_MESSAGES = {
     "python_version": "Python 3.9 or newer is required. Install a newer Python 3, or set VANTAGE_CODEX_PYTHON to one.",
+    "python_tls": (
+        "Your Python can't connect securely to Vantage (it lacks TLS 1.3). "
+        "Install Python from Homebrew (`brew install python`) or python.org, "
+        "or set VANTAGE_CODEX_PYTHON to one that supports TLS 1.3."
+    ),
     "sqlite": "Python's sqlite3 module is missing. Install a Python 3 build that includes SQLite.",
     "curl_missing": "curl is unavailable. Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
     "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
@@ -91,6 +98,8 @@ def requirement_problems(*, version=None, os_name=None, which=shutil.which, run=
     problems = []
     if version < MIN_PYTHON:
         problems.append("python_version")
+    if not ssl.HAS_TLSv1_3:
+        problems.append("python_tls")
     try:
         import sqlite3  # noqa: F401 - the attribution outbox needs it
     except ImportError:
@@ -526,6 +535,17 @@ def browser_sign_in():
     return code_verifier, authorization_expires_at
 
 
+class TLSConnectionError(ValueError):
+    def __init__(self):
+        super().__init__(REQUIREMENT_MESSAGES["python_tls"])
+
+
+def is_tls_error(error):
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    return isinstance(error, ssl.SSLError)
+
+
 def wait_for_setup_credentials(code_verifier, authorization_expires_at):
     remaining = authorization_expires_at - time.time()
     if remaining <= 0:
@@ -576,6 +596,8 @@ def wait_for_setup_credentials(code_verifier, authorization_expires_at):
                 detail = "Setup could not be completed."
             raise ValueError(detail) from error
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            if is_tls_error(error):
+                raise TLSConnectionError() from error
             raise ValueError("Vantage could not be reached to complete setup.") from error
 
         token = payload.get("plaintext_token") if isinstance(payload, dict) else None
@@ -622,6 +644,8 @@ def verify_ingest_token(token):
                 raise ValueError("Vantage rejected the new ingest credential.") from error
             raise ValueError("Vantage could not verify the new ingest credential.") from error
         except (OSError, urllib.error.URLError) as error:
+            if is_tls_error(error):
+                raise TLSConnectionError() from error
             raise ValueError("Vantage could not be reached to verify the new ingest credential.") from error
 
 
@@ -732,6 +756,9 @@ def main():
             verify_ingest_token(token)
             save_classifier(credentials["classifier"])
             save_connection(token)
+        except TLSConnectionError as error:
+            print(error, file=sys.stderr)
+            return TLS_ERROR_EXIT
         except (OSError, UnicodeError, ValueError) as error:
             print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
             return 2
@@ -764,6 +791,9 @@ def main():
         verify_ingest_token(token)
         save_classifier(credentials["classifier"])
         save_connection(token)
+    except TLSConnectionError as error:
+        print(error, file=sys.stderr)
+        return TLS_ERROR_EXIT
     except (OSError, UnicodeError, ValueError) as error:
         print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
         return 2

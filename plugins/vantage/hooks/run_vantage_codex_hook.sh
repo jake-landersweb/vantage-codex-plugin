@@ -2,7 +2,19 @@
 
 python_path="${VANTAGE_CODEX_PYTHON:-}"
 if [ -z "$python_path" ]; then
-  python_path="$(command -v python3 2>/dev/null || true)"
+  while IFS= read -r candidate; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+      python_path="$candidate"
+      break
+    fi
+  done <<EOF
+${VANTAGE_CODEX_PYTHON_CANDIDATES-/opt/homebrew/bin/python3
+/usr/local/bin/python3
+/Library/Frameworks/Python.framework/Versions/Current/bin/python3}
+EOF
+  if [ -z "$python_path" ]; then
+    python_path="$(command -v python3 2>/dev/null || true)"
+  fi
 fi
 
 if [ -z "$python_path" ] || [ ! -x "$python_path" ]; then

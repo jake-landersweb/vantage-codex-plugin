@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import ssl
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,10 +23,21 @@ SETUP_SCRIPT = (
 
 
 MISSING_REQUIREMENTS_EXIT = 6
+TLS_ERROR_EXIT = 7
+MAC_PYTHON_CANDIDATES = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+)
 # Fixed messages keyed by the IDs the setup script reports. The server never
 # returns the script's own output, so only these known IDs reach the agent.
 REQUIREMENT_MESSAGES = {
     "python_version": "Install Python 3.9 or newer (or set VANTAGE_CODEX_PYTHON to one).",
+    "python_tls": (
+        "Your Python can't connect securely to Vantage (it lacks TLS 1.3). "
+        "Install Python from Homebrew (`brew install python`) or python.org, "
+        "or set VANTAGE_CODEX_PYTHON to one that supports TLS 1.3."
+    ),
     "sqlite": "Install a Python 3 build that includes the sqlite3 module.",
     "curl_missing": "Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
     "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
@@ -122,6 +134,7 @@ def outcome_from_completed(action, completed):
         3: "Existing OpenTelemetry settings prevent automatic setup. Review your Codex telemetry configuration and retry.",
         4: "Vantage telemetry setup requires Python 3.9 or newer.",
         5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
+        TLS_ERROR_EXIT: REQUIREMENT_MESSAGES["python_tls"],
     }
     return SetupOutcome(
         "error",
@@ -568,12 +581,33 @@ def serve(input_stream=None, output_stream=None, runner=run_tool_action):
         stop_active_setup()
 
 
+def find_tls_python(current_python):
+    probe = "import ssl,sys,sqlite3; sys.exit(0 if sys.version_info>=(3,9) and ssl.HAS_TLSv1_3 else 1)"
+    for candidate in MAC_PYTHON_CANDIDATES:
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        if os.path.realpath(candidate) == current_python:
+            continue
+        try:
+            completed = subprocess.run(
+                [candidate, "-I", "-c", probe], capture_output=True, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode == 0:
+            return candidate
+    return None
+
+
 def main():
     python_path = os.environ.get("VANTAGE_CODEX_PYTHON")
-    if python_path and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+    current_python = os.path.realpath(sys.executable)
+    if not python_path and not ssl.HAS_TLSv1_3:
+        python_path = find_tls_python(current_python)
+    if python_path and os.path.realpath(python_path) != current_python:
         command = [python_path, "-I", str(pathlib.Path(__file__).resolve())]
         environment = os.environ.copy()
-        del environment["VANTAGE_CODEX_PYTHON"]
+        environment["VANTAGE_CODEX_PYTHON"] = python_path
         try:
             return subprocess.call(command, env=environment)
         except OSError:

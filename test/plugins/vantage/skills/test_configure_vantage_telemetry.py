@@ -6,8 +6,11 @@ import io
 import json
 import os
 import pathlib
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import unittest
 from unittest import mock
@@ -46,6 +49,27 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "requirement_warnings", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_tls_request_failure_reports_actionable_guidance(self):
+        for failed_request in ("claim", "ingest"):
+            for wrapped in (False, True):
+                with self.subTest(failed_request=failed_request, wrapped=wrapped), \
+                        tempfile.TemporaryDirectory() as codex_home, \
+                        mock.patch.dict(os.environ, CODEX_HOME=codex_home), \
+                        mock.patch.object(sys, "argv", ["setup"]), \
+                        mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", time.time() + 60)), \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    tls_error = ssl.SSLError("TLSV1_ALERT_PROTOCOL_VERSION")
+                    if wrapped:
+                        tls_error = urllib.error.URLError(tls_error)
+                    responses = [tls_error]
+                    if failed_request == "ingest":
+                        responses.insert(0, Response(200, self.setup_payload()))
+                    with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
+                        self.assertEqual(MODULE.TLS_ERROR_EXIT, MODULE.main())
+                    self.assertIn("lacks TLS 1.3", stderr.getvalue())
+                    self.assertIn("VANTAGE_CODEX_PYTHON", stderr.getvalue())
+                    self.assertFalse((pathlib.Path(codex_home) / "config.toml").exists())
 
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
         profile_variable = "USERPROFILE" if os.name == "nt" else "HOME"
@@ -495,6 +519,11 @@ exporter = { otlp-http = { endpoint = "https://ingest-staging.vantage.sh/v1/logs
             self.assertFalse((pathlib.Path(codex_home) / "vantage").exists())
 
 class RequirementChecksTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(ssl, "HAS_TLSv1_3", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def curl_version(features):
         completed = mock.Mock(stdout="curl 8.5.0\nProtocols: http https\nFeatures: %s\n" % features)
@@ -564,6 +593,20 @@ class RequirementChecksTest(unittest.TestCase):
             self.assertFalse((pathlib.Path(codex_dir) / "config.toml").exists())
         sign_in.assert_not_called()
         self.assertIn("requirement:curl_missing ", stderr.getvalue())
+
+    def test_setup_reports_python_tls_before_sign_in(self):
+        check_requirements = MODULE.requirement_problems
+        with mock.patch.object(ssl, "HAS_TLSv1_3", False), \
+                mock.patch.object(sys, "argv", ["setup"]), \
+                mock.patch.object(MODULE, "requirement_problems", side_effect=lambda: check_requirements(
+                    which=lambda _: "/usr/bin/curl", run=self.curl_version("HTTP2")
+                )), \
+                mock.patch.object(MODULE, "browser_sign_in") as sign_in, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(MODULE.MISSING_REQUIREMENTS_EXIT, MODULE.main())
+        sign_in.assert_not_called()
+        self.assertIn("requirement:python_tls ", stderr.getvalue())
+        self.assertIn("lacks TLS 1.3", stderr.getvalue())
 
     def test_remove_works_even_when_requirements_are_missing(self):
         with tempfile.TemporaryDirectory() as codex_dir, mock.patch.dict(os.environ, CODEX_HOME=codex_dir), \

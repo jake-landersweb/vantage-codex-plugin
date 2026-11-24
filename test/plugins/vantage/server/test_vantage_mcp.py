@@ -586,6 +586,23 @@ class RequirementOutcomeTest(unittest.TestCase):
         self.assertEqual(set(setup.REQUIREMENT_MESSAGES), set(MODULE.REQUIREMENT_MESSAGES))
         self.assertEqual(setup.WARNING_MESSAGES, MODULE.WARNING_MESSAGES)
         self.assertEqual(setup.MISSING_REQUIREMENTS_EXIT, MODULE.MISSING_REQUIREMENTS_EXIT)
+        self.assertEqual(setup.TLS_ERROR_EXIT, MODULE.TLS_ERROR_EXIT)
+        self.assertEqual(setup.REQUIREMENT_MESSAGES["python_tls"], MODULE.REQUIREMENT_MESSAGES["python_tls"])
+
+    def test_reports_the_same_tls_guidance_for_preflight_and_request_failures(self):
+        completed = subprocess.CompletedProcess(
+            ["setup"], MODULE.MISSING_REQUIREMENTS_EXIT, stdout="",
+            stderr="requirement:python_tls untrusted detail",
+        )
+        preflight = MODULE.outcome_from_completed("connect", completed)
+        completed.returncode = MODULE.TLS_ERROR_EXIT
+        request_failure = MODULE.outcome_from_completed("connect", completed)
+        self.assertEqual("missing_requirements", preflight.status)
+        self.assertEqual("error", request_failure.status)
+        self.assertTrue(request_failure.is_error)
+        self.assertIn("lacks TLS 1.3", request_failure.message)
+        self.assertIn(request_failure.message, preflight.message)
+        self.assertNotIn("untrusted detail", request_failure.message)
 
     def test_git_warning_is_returned_with_success_using_fixed_text(self):
         for stdout, status in [("configured", "connected"), ("already configured", "already_connected")]:
@@ -608,10 +625,62 @@ class RequirementOutcomeTest(unittest.TestCase):
         stderr = io.StringIO()
         with mock.patch.dict(os.environ, VANTAGE_CODEX_PYTHON=""), \
                 mock.patch.object(sys, "version_info", (3, 8)), mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(MODULE, "find_tls_python", return_value=None), \
                 mock.patch.object(MODULE, "serve") as serve:
             self.assertEqual(4, MODULE.main())
         serve.assert_not_called()
         self.assertIn("Python 3.9 or newer", stderr.getvalue())
+
+
+class PythonSelectionTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Mac candidates use POSIX executable paths")
+    def test_mcp_relaunches_only_under_a_candidate_that_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            current = root / "current-python"
+            rejected = root / "old-python"
+            capable = root / "homebrew" / "python3"
+            capable.parent.mkdir()
+            current.symlink_to(sys.executable)
+            rejected.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            rejected.chmod(0o700)
+            capable.write_text(
+                '#!/bin/sh\n[ "$1" = -I ] && [ "$2" = -c ] && [ -n "$3" ]\n',
+                encoding="utf-8",
+            )
+            capable.chmod(0o700)
+            with mock.patch.dict(os.environ, VANTAGE_CODEX_PYTHON=""), \
+                    mock.patch.object(MODULE.ssl, "HAS_TLSv1_3", False), \
+                    mock.patch.object(MODULE, "serve") as serve, \
+                    mock.patch.object(MODULE.subprocess, "call", return_value=8) as relaunch:
+                with mock.patch.object(MODULE, "MAC_PYTHON_CANDIDATES", (str(current), str(rejected))):
+                    self.assertEqual(0, MODULE.main())
+                serve.assert_called_once_with()
+                relaunch.assert_not_called()
+                serve.reset_mock()
+
+                with mock.patch.object(MODULE, "MAC_PYTHON_CANDIDATES", (str(current), str(rejected), str(capable))):
+                    self.assertEqual(8, MODULE.main())
+                serve.assert_not_called()
+                relaunch.assert_called_once_with(
+                    [str(capable), "-I", str(SCRIPT)],
+                    env={**os.environ, "VANTAGE_CODEX_PYTHON": str(capable)},
+                )
+
+    def test_mcp_skips_probes_when_python_is_explicit(self):
+        explicit = str(pathlib.Path(sys.executable).with_name("explicit-python"))
+        with mock.patch.object(MODULE.ssl, "HAS_TLSv1_3", False), \
+                mock.patch.object(MODULE, "find_tls_python") as probe, \
+                mock.patch.object(MODULE.subprocess, "call", return_value=0) as relaunch, \
+                mock.patch.object(MODULE, "serve") as serve:
+            with mock.patch.dict(os.environ, VANTAGE_CODEX_PYTHON=explicit):
+                self.assertEqual(0, MODULE.main())
+                relaunch.assert_called_once_with([explicit, "-I", str(SCRIPT)], env=dict(os.environ))
+                serve.assert_not_called()
+            with mock.patch.dict(os.environ, VANTAGE_CODEX_PYTHON=sys.executable):
+                self.assertEqual(0, MODULE.main())
+                serve.assert_called_once_with()
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

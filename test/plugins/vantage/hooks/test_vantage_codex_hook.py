@@ -4,10 +4,13 @@ import io
 import json
 import os
 import runpy
+import ssl
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -92,6 +95,51 @@ class VantageCodexHookTest(unittest.TestCase):
             '"new"',
             (codex_home / "vantage" / "classifier.etag").read_text(encoding="utf-8"),
         )
+
+    def test_classifier_tls_errors_preserve_the_cache_and_are_reported_in_status(self):
+        codex_home = self.directory / "codex"
+        self.install_cached_classifier(codex_home, token=True)
+        connection = codex_home / "vantage" / "connection.json"
+        opener = mock.Mock()
+        tls_error = ssl.SSLError("TLSV1_ALERT_PROTOCOL_VERSION")
+        opener.open.side_effect = [tls_error, urllib.error.URLError(tls_error), OSError("offline")]
+        env = {**os.environ, "CODEX_HOME": str(codex_home), "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage")}
+
+        with mock.patch.object(HOOK, "CONNECTION", connection), \
+                mock.patch.object(HOOK, "STATE"), mock.patch.object(HOOK, "TOKEN"), \
+                mock.patch.object(HOOK, "OPT_IN"), mock.patch.object(HOOK, "ENDPOINT"), \
+                mock.patch.object(HOOK.urllib.request, "build_opener", return_value=opener):
+            HOOK.load_connection()
+            with closing(HOOK.connect()) as db:
+                for _ in range(3):
+                    self.assertTrue(HOOK.refresh_classifier(env, stderr=io.StringIO(), db=db))
+
+        self.assertEqual("# Test classifier\n", (codex_home / "vantage" / "classifier.md").read_text(encoding="utf-8"))
+        result = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT.with_name("run_vantage_codex_hook.py")), "status"],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertIn("classifier_tls_error 2", result.stdout.splitlines())
+
+    @unittest.skipIf(os.name == "nt", "the POSIX hook launcher is a shell script")
+    def test_launcher_prefers_homebrew_python_without_probing(self):
+        launcher = SCRIPT.with_name("run_vantage_codex_hook.sh")
+        homebrew = self.directory / "homebrew bin" / "python3"
+        homebrew.parent.mkdir()
+        homebrew.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        homebrew.chmod(0o700)
+        later = self.directory / "python3"
+        later.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        later.chmod(0o700)
+        env = {
+            **os.environ,
+            "VANTAGE_CODEX_PYTHON": "",
+            "VANTAGE_CODEX_PYTHON_CANDIDATES": f"{homebrew}\n{later}",
+        }
+        result = subprocess.run(
+            ["sh", str(launcher)], env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(["-I", str(launcher.with_suffix(".py"))], result.stdout.splitlines())
 
     @unittest.skipIf(os.name == "nt", "the POSIX hook launcher is a shell script")
     def test_launcher_skips_the_hook_when_python_is_unavailable(self):

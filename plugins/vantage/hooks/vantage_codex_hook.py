@@ -18,6 +18,7 @@ import platform
 import shlex
 import shutil
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
@@ -363,7 +364,7 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def refresh_classifier(env, stderr=sys.stderr):
+def refresh_classifier(env, stderr=sys.stderr, *, db=None):
     cached = classifier_markdown_path(env).is_file()
     try:
         try:
@@ -415,6 +416,12 @@ def refresh_classifier(env, stderr=sys.stderr):
                 write_private_file(classifier_etag_path(env), new_etag.encode("utf-8"))
         return True
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        if db is not None and isinstance(reason, ssl.SSLError):
+            db.execute(
+                "INSERT INTO diagnostics VALUES ('classifier_tls_error',1) "
+                "ON CONFLICT(name) DO UPDATE SET count=count+1"
+            )
         print(
             f"[vantage_codex_hook] classifier refresh failed: {type(error).__name__}",
             file=stderr,
@@ -1028,7 +1035,7 @@ def handle(db, name, payload):
     if event == "PostToolUse" and payload.get("tool_name") not in GIT_TOOLS:
         return
     if event == "SessionStart":
-        refresh_classifier(os.environ)
+        refresh_classifier(os.environ, db=db)
     SOURCE = event
     model = identifier(payload.get("model"))
     version = identifier(payload.get("cli_version") or payload.get("agent_version"))

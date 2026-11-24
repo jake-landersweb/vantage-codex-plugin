@@ -38,8 +38,13 @@ the updated hooks to apply the shell and edit tool filter.
 The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
-TLS and OTLP/gRPC. The bundled tools start with `python3` on `PATH` and require
-Python 3.9+ with SQLite support and curl with HTTP/2 support.
+TLS and OTLP/gRPC. Setup requires Python 3.9+ with SQLite and TLS 1.3 support,
+and curl with HTTP/2 support.
+
+On macOS, the MCP server checks common Homebrew and python.org locations
+when the default Python lacks TLS 1.3. The hook launcher prefers those
+locations before checking `PATH`. To use a specific installation, set
+`VANTAGE_CODEX_PYTHON` to its full executable path.
 
 On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
 and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
@@ -95,6 +100,7 @@ Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
 `pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,
 `retry_in_seconds`, and the cumulative `rollout_io_errors` (absent means zero).
+`classifier_tls_error` counts classifier refreshes that failed with a TLS error.
 The outbox counts unacknowledged events. A backlog that grows across turns
 while acknowledgements advance indicates the sender is falling behind.
 A stalled acknowledgement with increasing failures indicates a delivery
