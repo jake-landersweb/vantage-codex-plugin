@@ -8,6 +8,7 @@ import runpy
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import tempfile
 import unittest
@@ -561,6 +562,56 @@ class VantageMcpTest(unittest.TestCase):
         self.assertEqual("python3", MCP_SERVER["command"])
         self.assertEqual(["-I", "${PLUGIN_ROOT}/server/vantage_mcp.py"], MCP_SERVER["args"])
         self.assertEqual("${PLUGIN_ROOT}", MCP_SERVER["cwd"])
+
+
+class RequirementOutcomeTest(unittest.TestCase):
+    def test_maps_requirement_ids_to_fixed_messages(self):
+        completed = subprocess.CompletedProcess(
+            ["setup"], 6, stdout="",
+            stderr="Vantage telemetry setup needs a few things first:\n"
+                   "requirement:curl_http2 anything\nrequirement:bogus Bearer secret-token\n",
+        )
+        outcome = MODULE.outcome_from_completed("connect", completed)
+        self.assertEqual("missing_requirements", outcome.status)
+        self.assertTrue(outcome.is_error)
+        self.assertIn("HTTP/2", outcome.message)
+        self.assertNotIn("secret-token", outcome.message)
+        self.assertNotIn("bogus", outcome.message)
+
+    def test_requirement_ids_match_the_setup_script(self):
+        script = ROOT / "plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
+        spec = importlib.util.spec_from_file_location("configure_for_ids", script)
+        setup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(setup)
+        self.assertEqual(set(setup.REQUIREMENT_MESSAGES), set(MODULE.REQUIREMENT_MESSAGES))
+        self.assertEqual(setup.WARNING_MESSAGES, MODULE.WARNING_MESSAGES)
+        self.assertEqual(setup.MISSING_REQUIREMENTS_EXIT, MODULE.MISSING_REQUIREMENTS_EXIT)
+
+    def test_git_warning_is_returned_with_success_using_fixed_text(self):
+        for stdout, status in [("configured", "connected"), ("already configured", "already_connected")]:
+            with self.subTest(status=status):
+                completed = subprocess.CompletedProcess(
+                    ["setup"], 0, stdout=stdout,
+                    stderr="warning:git_attribution untrusted token\nwarning:unknown untrusted output\n",
+                )
+                outcome = MODULE.outcome_from_completed("connect", completed)
+                self.assertEqual(status, outcome.status)
+                self.assertFalse(outcome.is_error)
+                self.assertIn("Install Git for repository", outcome.message)
+                self.assertNotIn("untrusted", outcome.message)
+
+    def test_status_enum_includes_missing_requirements(self):
+        schema = MODULE.tool_definitions()[0]["outputSchema"]
+        self.assertIn("missing_requirements", schema["properties"]["status"]["enum"])
+
+    def test_mcp_rejects_python_older_than_3_9(self):
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, VANTAGE_CODEX_PYTHON=""), \
+                mock.patch.object(sys, "version_info", (3, 8)), mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(MODULE, "serve") as serve:
+            self.assertEqual(4, MODULE.main())
+        serve.assert_not_called()
+        self.assertIn("Python 3.9 or newer", stderr.getvalue())
 
 
 if __name__ == "__main__":

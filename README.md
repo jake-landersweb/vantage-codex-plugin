@@ -39,7 +39,7 @@ The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
 TLS and OTLP/gRPC. The bundled tools start with `python3` on `PATH` and require
-Python 3.9+ and curl with HTTP/2 support.
+Python 3.9+ with SQLite support and curl with HTTP/2 support.
 
 On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
 and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
@@ -53,6 +53,10 @@ Keep `CODEX_HOME` in a private directory in your Windows user profile so
 credentials inherit its access permissions.
 
 ## What gets recorded
+
+Repository, worktree, branch, and commit attribution use Git. If Git is
+unavailable, setup shows a warning and continues.
+Usage reporting and classifier tags can still work.
 
 Each user prompt opens a turn snapshot. The hook captures Git and developer
 identity observations (including the effective Git `user.name` and `user.email`), model request fingerprints, and classifier tags. Setup

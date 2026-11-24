@@ -21,6 +21,33 @@ SETUP_SCRIPT = (
 )
 
 
+MISSING_REQUIREMENTS_EXIT = 6
+# Fixed messages keyed by the IDs the setup script reports. The server never
+# returns the script's own output, so only these known IDs reach the agent.
+REQUIREMENT_MESSAGES = {
+    "python_version": "Install Python 3.9 or newer (or set VANTAGE_CODEX_PYTHON to one).",
+    "sqlite": "Install a Python 3 build that includes the sqlite3 module.",
+    "curl_missing": "Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
+    "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
+}
+WARNING_MESSAGES = {
+    "git_attribution": (
+        "Install Git for repository, worktree, branch, and commit attribution. "
+        "Usage reporting and classifier tags can still work."
+    ),
+}
+
+
+def notice_ids(stderr, prefix, messages):
+    ids = {}
+    for line in (stderr or "").splitlines():
+        if line.startswith(prefix):
+            notice = line[len(prefix):].split(" ", 1)[0]
+            if notice in messages:
+                ids[notice] = None
+    return ids
+
+
 def plugin_version():
     try:
         payload = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
@@ -64,19 +91,28 @@ def outcome_from_completed(action, completed):
                 "Vantage telemetry was removed. Restart Codex to apply the change.",
                 True,
             )
-        if "already configured" in output:
-            return SetupOutcome(
-                "already_connected",
-                "Vantage telemetry is already connected. Review and trust the Vantage "
-                "hooks in /hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-                "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
-                True,
-            )
+        already_connected = "already configured" in output
+        status = "already_connected" if already_connected else "connected"
+        connection = "already connected" if already_connected else "connected"
+        warnings = notice_ids(completed.stderr, "warning:", WARNING_MESSAGES)
+        warning_text = "".join("\n\n" + WARNING_MESSAGES[warning] for warning in warnings)
         return SetupOutcome(
-            "connected",
-            "Vantage telemetry is connected. Review and trust the Vantage hooks in "
+            status,
+            f"Vantage telemetry is {connection}. Review and trust the Vantage hooks in "
             "/hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
+            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts."
+            + warning_text,
+            True,
+        )
+
+    if completed.returncode == MISSING_REQUIREMENTS_EXIT:
+        problems = notice_ids(completed.stderr, "requirement:", REQUIREMENT_MESSAGES)
+        steps = " ".join("- %s" % REQUIREMENT_MESSAGES[problem] for problem in problems)
+        return SetupOutcome(
+            "missing_requirements",
+            "Vantage telemetry can't be set up until these are installed: %s "
+            "Then run setup again." % (steps or "- Check that Python 3.9+ and curl with HTTP/2 are installed."),
+            False,
             True,
         )
 
@@ -84,7 +120,7 @@ def outcome_from_completed(action, completed):
         1: "Codex telemetry configuration could not be read safely.",
         2: "Vantage sign-in or credential verification did not complete. Start setup again.",
         3: "Existing OpenTelemetry settings prevent automatic setup. Review your Codex telemetry configuration and retry.",
-        4: "Vantage telemetry setup requires Python 3.",
+        4: "Vantage telemetry setup requires Python 3.9 or newer.",
         5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
     }
     return SetupOutcome(
@@ -248,6 +284,7 @@ def tool_definitions():
                     "already_connected",
                     "removed",
                     "not_configured",
+                    "missing_requirements",
                     "error",
                 ],
             },

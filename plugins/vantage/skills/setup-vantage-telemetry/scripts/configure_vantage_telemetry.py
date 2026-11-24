@@ -11,6 +11,7 @@ import re
 import secrets
 import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,68 @@ if not isinstance(PLUGIN_VERSION, str) or not PLUGIN_VERSION:
 USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
+MIN_PYTHON = (3, 9)
+MISSING_REQUIREMENTS_EXIT = 6
+REQUIREMENT_MESSAGES = {
+    "python_version": "Python 3.9 or newer is required. Install a newer Python 3, or set VANTAGE_CODEX_PYTHON to one.",
+    "sqlite": "Python's sqlite3 module is missing. Install a Python 3 build that includes SQLite.",
+    "curl_missing": "curl is unavailable. Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
+    "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
+}
+WARNING_MESSAGES = {
+    "git_attribution": (
+        "Install Git for repository, worktree, branch, and commit attribution. "
+        "Usage reporting and classifier tags can still work."
+    ),
+}
+
+
+def curl_supports_http2(curl, run=subprocess.run):
+    try:
+        completed = run([curl, "-V"], capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in (completed.stdout or "").splitlines():
+        if line.lower().startswith("features:"):
+            return "HTTP2" in line.split()
+    return False
+
+
+def requirement_problems(*, version=None, os_name=None, which=shutil.which, run=subprocess.run):
+    """Return the IDs of missing prerequisites, in the order a user should fix them."""
+    version = tuple(sys.version_info[:2] if version is None else version)
+    os_name = os.name if os_name is None else os_name
+    problems = []
+    if version < MIN_PYTHON:
+        problems.append("python_version")
+    try:
+        import sqlite3  # noqa: F401 - the attribution outbox needs it
+    except ImportError:
+        problems.append("sqlite")
+    curl = os.environ.get("VANTAGE_CODEX_CURL") or ("curl.exe" if os_name == "nt" else "curl")
+    if not which(curl):
+        problems.append("curl_missing")
+    elif not curl_supports_http2(curl, run=run):
+        problems.append("curl_http2")
+    return problems
+
+
+def requirement_warnings(run=subprocess.run):
+    try:
+        completed = run(["git", "--version"], capture_output=True, text=True, timeout=0.5, check=False)
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return ["git_attribution"]
+    if completed.returncode != 0 or not completed.stdout.startswith("git version "):
+        return ["git_attribution"]
+    return []
+
+
+def report_requirement_problems(problems, stream=None):
+    stream = stream or sys.stderr
+    print("Vantage telemetry setup needs a few things first:", file=stream)
+    for problem in problems:
+        # The MCP server reads only the ID before the first space.
+        print("requirement:%s %s" % (problem, REQUIREMENT_MESSAGES[problem]), file=stream)
 
 
 def codex_home_path():
@@ -577,7 +640,19 @@ def print_next_steps():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remove", action="store_true", help="remove the Vantage-managed block")
+    parser.add_argument("--check-requirements", action="store_true", help="check prerequisites only")
     args = parser.parse_args()
+
+    if not args.remove:
+        problems = requirement_problems()
+        if problems:
+            report_requirement_problems(problems)
+            return MISSING_REQUIREMENTS_EXIT
+        for warning in requirement_warnings():
+            print("warning:%s %s" % (warning, WARNING_MESSAGES[warning]), file=sys.stderr)
+        if args.check_requirements:
+            print("All Vantage telemetry requirements are installed.")
+            return 0
 
     path = config_path()
     original = ""
