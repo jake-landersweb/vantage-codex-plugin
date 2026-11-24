@@ -96,13 +96,15 @@ class VantageCodexHookTest(unittest.TestCase):
             (codex_home / "vantage" / "classifier.etag").read_text(encoding="utf-8"),
         )
 
-    def test_classifier_tls_errors_preserve_the_cache_and_are_reported_in_status(self):
+    def test_classifier_tls_and_certificate_errors_keep_the_cache_and_have_separate_counters(self):
         codex_home = self.directory / "codex"
         self.install_cached_classifier(codex_home, token=True)
         connection = codex_home / "vantage" / "connection.json"
         opener = mock.Mock()
         tls_error = ssl.SSLError("TLSV1_ALERT_PROTOCOL_VERSION")
-        opener.open.side_effect = [tls_error, urllib.error.URLError(tls_error), OSError("offline")]
+        cert_error = ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED")
+        errors = [tls_error, urllib.error.URLError(tls_error), cert_error, urllib.error.URLError(cert_error), OSError("offline")]
+        opener.open.side_effect = errors
         env = {**os.environ, "CODEX_HOME": str(codex_home), "VANTAGE_CODEX_PLUGIN_ROOT": str(ROOT / "plugins/vantage")}
 
         with mock.patch.object(HOOK, "CONNECTION", connection), \
@@ -111,7 +113,7 @@ class VantageCodexHookTest(unittest.TestCase):
                 mock.patch.object(HOOK.urllib.request, "build_opener", return_value=opener):
             HOOK.load_connection()
             with closing(HOOK.connect()) as db:
-                for _ in range(3):
+                for _ in errors:
                     self.assertTrue(HOOK.refresh_classifier(env, stderr=io.StringIO(), db=db))
 
         self.assertEqual("# Test classifier\n", (codex_home / "vantage" / "classifier.md").read_text(encoding="utf-8"))
@@ -120,6 +122,7 @@ class VantageCodexHookTest(unittest.TestCase):
             env=env, capture_output=True, text=True, check=True,
         )
         self.assertIn("classifier_tls_error 2", result.stdout.splitlines())
+        self.assertIn("classifier_cert_error 2", result.stdout.splitlines())
 
     @unittest.skipIf(os.name == "nt", "the POSIX hook launcher is a shell script")
     def test_launcher_prefers_homebrew_python_without_probing(self):

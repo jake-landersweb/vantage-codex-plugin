@@ -24,6 +24,7 @@ SETUP_SCRIPT = (
 
 MISSING_REQUIREMENTS_EXIT = 6
 TLS_ERROR_EXIT = 7
+CERTIFICATE_ERROR_EXIT = 8
 MAC_PYTHON_CANDIDATES = (
     "/opt/homebrew/bin/python3",
     "/usr/local/bin/python3",
@@ -135,6 +136,11 @@ def outcome_from_completed(action, completed):
         4: "Vantage telemetry setup requires Python 3.9 or newer.",
         5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
         TLS_ERROR_EXIT: REQUIREMENT_MESSAGES["python_tls"],
+        CERTIFICATE_ERROR_EXIT: (
+            "Python can't verify Vantage's certificate. If you installed Python from python.org, "
+            "run 'Install Certificates.command'. On a company network, set SSL_CERT_FILE to "
+            "your company's CA bundle."
+        ),
     }
     return SetupOutcome(
         "error",

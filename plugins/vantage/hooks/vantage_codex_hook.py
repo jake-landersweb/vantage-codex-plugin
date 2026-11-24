@@ -418,9 +418,11 @@ def refresh_classifier(env, stderr=sys.stderr, *, db=None):
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError, urllib.error.URLError) as error:
         reason = error.reason if isinstance(error, urllib.error.URLError) else error
         if db is not None and isinstance(reason, ssl.SSLError):
+            name = "classifier_cert_error" if isinstance(reason, ssl.SSLCertVerificationError) else "classifier_tls_error"
             db.execute(
-                "INSERT INTO diagnostics VALUES ('classifier_tls_error',1) "
-                "ON CONFLICT(name) DO UPDATE SET count=count+1"
+                "INSERT INTO diagnostics VALUES (?,1) "
+                "ON CONFLICT(name) DO UPDATE SET count=count+1",
+                (name,),
             )
         print(
             f"[vantage_codex_hook] classifier refresh failed: {type(error).__name__}",

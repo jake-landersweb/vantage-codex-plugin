@@ -100,7 +100,8 @@ Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
 `pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,
 `retry_in_seconds`, and the cumulative `rollout_io_errors` (absent means zero).
-`classifier_tls_error` counts classifier refreshes that failed with a TLS error.
+Classifier refresh failures count toward `classifier_cert_error` when
+certificate verification fails and `classifier_tls_error` for other TLS errors.
 The outbox counts unacknowledged events. A backlog that grows across turns
 while acknowledgements advance indicates the sender is falling behind.
 A stalled acknowledgement with increasing failures indicates a delivery

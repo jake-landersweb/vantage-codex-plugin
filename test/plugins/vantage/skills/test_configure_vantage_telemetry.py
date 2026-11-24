@@ -51,25 +51,37 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_tls_request_failure_reports_actionable_guidance(self):
-        for failed_request in ("claim", "ingest"):
-            for wrapped in (False, True):
-                with self.subTest(failed_request=failed_request, wrapped=wrapped), \
-                        tempfile.TemporaryDirectory() as codex_home, \
-                        mock.patch.dict(os.environ, CODEX_HOME=codex_home), \
-                        mock.patch.object(sys, "argv", ["setup"]), \
-                        mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", time.time() + 60)), \
-                        contextlib.redirect_stderr(io.StringIO()) as stderr:
-                    tls_error = ssl.SSLError("TLSV1_ALERT_PROTOCOL_VERSION")
-                    if wrapped:
-                        tls_error = urllib.error.URLError(tls_error)
-                    responses = [tls_error]
-                    if failed_request == "ingest":
-                        responses.insert(0, Response(200, self.setup_payload()))
-                    with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses):
-                        self.assertEqual(MODULE.TLS_ERROR_EXIT, MODULE.main())
-                    self.assertIn("lacks TLS 1.3", stderr.getvalue())
-                    self.assertIn("VANTAGE_CODEX_PYTHON", stderr.getvalue())
-                    self.assertFalse((pathlib.Path(codex_home) / "config.toml").exists())
+        errors = [
+            ("TLSV1_ALERT_PROTOCOL_VERSION", ssl.SSLError, MODULE.TLS_ERROR_EXIT, "lacks TLS 1.3"),
+            ("UNSUPPORTED_PROTOCOL", ssl.SSLError, MODULE.TLS_ERROR_EXIT, "lacks TLS 1.3"),
+            ("CERTIFICATE_VERIFY_FAILED", ssl.SSLCertVerificationError, MODULE.CERTIFICATE_ERROR_EXIT, "SSL_CERT_FILE"),
+            ("SSLV3_ALERT_HANDSHAKE_FAILURE", ssl.SSLError, 2, "Could not complete Vantage setup"),
+        ]
+        for reason, error_class, exit_code, message in errors:
+            for failed_request in ("claim", "ingest"):
+                for wrapped in (False, True):
+                    with self.subTest(reason=reason, failed_request=failed_request, wrapped=wrapped):
+                        error = error_class(reason)
+                        error.reason = reason
+                        if wrapped:
+                            error = urllib.error.URLError(error)
+                        self.assert_setup_request_failure(failed_request, error, exit_code, message)
+
+    def assert_setup_request_failure(self, failed_request, error, exit_code, message):
+        responses = [error]
+        if failed_request == "ingest":
+            responses.insert(0, Response(200, self.setup_payload()))
+        with tempfile.TemporaryDirectory() as codex_home, \
+                mock.patch.dict(os.environ, CODEX_HOME=codex_home), \
+                mock.patch.object(sys, "argv", ["setup"]), \
+                mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", time.time() + 60)), \
+                mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(exit_code, MODULE.main())
+            self.assertFalse((pathlib.Path(codex_home) / "config.toml").exists())
+        self.assertIn(message, stderr.getvalue())
+        if exit_code != MODULE.TLS_ERROR_EXIT:
+            self.assertNotIn("lacks TLS 1.3", stderr.getvalue())
 
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
         profile_variable = "USERPROFILE" if os.name == "nt" else "HOME"

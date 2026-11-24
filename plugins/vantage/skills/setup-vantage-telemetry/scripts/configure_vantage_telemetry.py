@@ -61,6 +61,12 @@ HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 MIN_PYTHON = (3, 9)
 MISSING_REQUIREMENTS_EXIT = 6
 TLS_ERROR_EXIT = 7
+CERTIFICATE_ERROR_EXIT = 8
+CERTIFICATE_ERROR_MESSAGE = (
+    "Python can't verify Vantage's certificate. If you installed Python from python.org, "
+    "run 'Install Certificates.command'. On a company network, set SSL_CERT_FILE to "
+    "your company's CA bundle."
+)
 REQUIREMENT_MESSAGES = {
     "python_version": "Python 3.9 or newer is required. Install a newer Python 3, or set VANTAGE_CODEX_PYTHON to one.",
     "python_tls": (
@@ -536,14 +542,19 @@ def browser_sign_in():
 
 
 class TLSConnectionError(ValueError):
-    def __init__(self):
-        super().__init__(REQUIREMENT_MESSAGES["python_tls"])
+    def __init__(self, message, exit_code):
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
-def is_tls_error(error):
-    if isinstance(error, urllib.error.URLError):
-        error = error.reason
-    return isinstance(error, ssl.SSLError)
+def raise_for_tls_error(error):
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        raise TLSConnectionError(CERTIFICATE_ERROR_MESSAGE, CERTIFICATE_ERROR_EXIT) from error
+    if isinstance(reason, ssl.SSLError) and getattr(reason, "reason", None) in {
+        "TLSV1_ALERT_PROTOCOL_VERSION", "UNSUPPORTED_PROTOCOL",
+    }:
+        raise TLSConnectionError(REQUIREMENT_MESSAGES["python_tls"], TLS_ERROR_EXIT) from error
 
 
 def wait_for_setup_credentials(code_verifier, authorization_expires_at):
@@ -596,8 +607,7 @@ def wait_for_setup_credentials(code_verifier, authorization_expires_at):
                 detail = "Setup could not be completed."
             raise ValueError(detail) from error
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-            if is_tls_error(error):
-                raise TLSConnectionError() from error
+            raise_for_tls_error(error)
             raise ValueError("Vantage could not be reached to complete setup.") from error
 
         token = payload.get("plaintext_token") if isinstance(payload, dict) else None
@@ -644,8 +654,7 @@ def verify_ingest_token(token):
                 raise ValueError("Vantage rejected the new ingest credential.") from error
             raise ValueError("Vantage could not verify the new ingest credential.") from error
         except (OSError, urllib.error.URLError) as error:
-            if is_tls_error(error):
-                raise TLSConnectionError() from error
+            raise_for_tls_error(error)
             raise ValueError("Vantage could not be reached to verify the new ingest credential.") from error
 
 
@@ -758,7 +767,7 @@ def main():
             save_connection(token)
         except TLSConnectionError as error:
             print(error, file=sys.stderr)
-            return TLS_ERROR_EXIT
+            return error.exit_code
         except (OSError, UnicodeError, ValueError) as error:
             print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
             return 2
@@ -793,7 +802,7 @@ def main():
         save_connection(token)
     except TLSConnectionError as error:
         print(error, file=sys.stderr)
-        return TLS_ERROR_EXIT
+        return error.exit_code
     except (OSError, UnicodeError, ValueError) as error:
         print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
         return 2

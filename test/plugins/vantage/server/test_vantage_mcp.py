@@ -587,6 +587,7 @@ class RequirementOutcomeTest(unittest.TestCase):
         self.assertEqual(setup.WARNING_MESSAGES, MODULE.WARNING_MESSAGES)
         self.assertEqual(setup.MISSING_REQUIREMENTS_EXIT, MODULE.MISSING_REQUIREMENTS_EXIT)
         self.assertEqual(setup.TLS_ERROR_EXIT, MODULE.TLS_ERROR_EXIT)
+        self.assertEqual(setup.CERTIFICATE_ERROR_EXIT, MODULE.CERTIFICATE_ERROR_EXIT)
         self.assertEqual(setup.REQUIREMENT_MESSAGES["python_tls"], MODULE.REQUIREMENT_MESSAGES["python_tls"])
 
     def test_reports_the_same_tls_guidance_for_preflight_and_request_failures(self):
@@ -603,6 +604,18 @@ class RequirementOutcomeTest(unittest.TestCase):
         self.assertIn("lacks TLS 1.3", request_failure.message)
         self.assertIn(request_failure.message, preflight.message)
         self.assertNotIn("untrusted detail", request_failure.message)
+
+    def test_certificate_error_uses_fixed_certificate_guidance(self):
+        completed = subprocess.CompletedProcess(
+            ["setup"], MODULE.CERTIFICATE_ERROR_EXIT, stdout="", stderr="untrusted detail",
+        )
+        outcome = MODULE.outcome_from_completed("connect", completed)
+        self.assertEqual("error", outcome.status)
+        self.assertTrue(outcome.is_error)
+        self.assertIn("Install Certificates.command", outcome.message)
+        self.assertIn("SSL_CERT_FILE", outcome.message)
+        self.assertNotIn("lacks TLS 1.3", outcome.message)
+        self.assertNotIn("untrusted detail", outcome.message)
 
     def test_git_warning_is_returned_with_success_using_fixed_text(self):
         for stdout, status in [("configured", "connected"), ("already configured", "already_connected")]:
