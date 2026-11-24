@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import ssl
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -19,6 +20,45 @@ SETUP_SCRIPT = (
     PLUGIN_ROOT
     / "skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
 )
+
+
+MISSING_REQUIREMENTS_EXIT = 6
+TLS_ERROR_EXIT = 7
+CERTIFICATE_ERROR_EXIT = 8
+MAC_PYTHON_CANDIDATES = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+)
+# Fixed messages keyed by the IDs the setup script reports. The server never
+# returns the script's own output, so only these known IDs reach the agent.
+REQUIREMENT_MESSAGES = {
+    "python_version": "Install Python 3.9 or newer (or set VANTAGE_CODEX_PYTHON to one).",
+    "python_tls": (
+        "Your Python can't connect securely to Vantage (it lacks TLS 1.3). "
+        "Install Python from Homebrew (`brew install python`) or python.org, "
+        "or set VANTAGE_CODEX_PYTHON to one that supports TLS 1.3."
+    ),
+    "sqlite": "Install a Python 3 build that includes the sqlite3 module.",
+    "curl_missing": "Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
+    "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
+}
+WARNING_MESSAGES = {
+    "git_attribution": (
+        "Install Git for repository, worktree, branch, and commit attribution. "
+        "Usage reporting and classifier tags can still work."
+    ),
+}
+
+
+def notice_ids(stderr, prefix, messages):
+    ids = {}
+    for line in (stderr or "").splitlines():
+        if line.startswith(prefix):
+            notice = line[len(prefix):].split(" ", 1)[0]
+            if notice in messages:
+                ids[notice] = None
+    return ids
 
 
 def plugin_version():
@@ -64,19 +104,28 @@ def outcome_from_completed(action, completed):
                 "Vantage telemetry was removed. Restart Codex to apply the change.",
                 True,
             )
-        if "already configured" in output:
-            return SetupOutcome(
-                "already_connected",
-                "Vantage telemetry is already connected. Review and trust the Vantage "
-                "hooks in /hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-                "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
-                True,
-            )
+        already_connected = "already configured" in output
+        status = "already_connected" if already_connected else "connected"
+        connection = "already connected" if already_connected else "connected"
+        warnings = notice_ids(completed.stderr, "warning:", WARNING_MESSAGES)
+        warning_text = "".join("\n\n" + WARNING_MESSAGES[warning] for warning in warnings)
         return SetupOutcome(
-            "connected",
-            "Vantage telemetry is connected. Review and trust the Vantage hooks in "
+            status,
+            f"Vantage telemetry is {connection}. Review and trust the Vantage hooks in "
             "/hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
+            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts."
+            + warning_text,
+            True,
+        )
+
+    if completed.returncode == MISSING_REQUIREMENTS_EXIT:
+        problems = notice_ids(completed.stderr, "requirement:", REQUIREMENT_MESSAGES)
+        steps = " ".join("- %s" % REQUIREMENT_MESSAGES[problem] for problem in problems)
+        return SetupOutcome(
+            "missing_requirements",
+            "Vantage telemetry can't be set up until these are installed: %s "
+            "Then run setup again." % (steps or "- Check that Python 3.9+ and curl with HTTP/2 are installed."),
+            False,
             True,
         )
 
@@ -84,8 +133,14 @@ def outcome_from_completed(action, completed):
         1: "Codex telemetry configuration could not be read safely.",
         2: "Vantage sign-in or credential verification did not complete. Start setup again.",
         3: "Existing OpenTelemetry settings prevent automatic setup. Review your Codex telemetry configuration and retry.",
-        4: "Vantage telemetry setup requires Python 3.",
+        4: "Vantage telemetry setup requires Python 3.9 or newer.",
         5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
+        TLS_ERROR_EXIT: REQUIREMENT_MESSAGES["python_tls"],
+        CERTIFICATE_ERROR_EXIT: (
+            "Python can't verify Vantage's certificate. If you installed Python from python.org, "
+            "run 'Install Certificates.command'. On a company network, set SSL_CERT_FILE to "
+            "your company's CA bundle."
+        ),
     }
     return SetupOutcome(
         "error",
@@ -248,6 +303,7 @@ def tool_definitions():
                     "already_connected",
                     "removed",
                     "not_configured",
+                    "missing_requirements",
                     "error",
                 ],
             },
@@ -531,12 +587,33 @@ def serve(input_stream=None, output_stream=None, runner=run_tool_action):
         stop_active_setup()
 
 
+def find_tls_python(current_python):
+    probe = "import ssl,sys,sqlite3; sys.exit(0 if sys.version_info>=(3,9) and ssl.HAS_TLSv1_3 else 1)"
+    for candidate in MAC_PYTHON_CANDIDATES:
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        if os.path.realpath(candidate) == current_python:
+            continue
+        try:
+            completed = subprocess.run(
+                [candidate, "-I", "-c", probe], capture_output=True, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode == 0:
+            return candidate
+    return None
+
+
 def main():
     python_path = os.environ.get("VANTAGE_CODEX_PYTHON")
-    if python_path and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+    current_python = os.path.realpath(sys.executable)
+    if not python_path and not ssl.HAS_TLSv1_3:
+        python_path = find_tls_python(current_python)
+    if python_path and os.path.realpath(python_path) != current_python:
         command = [python_path, "-I", str(pathlib.Path(__file__).resolve())]
         environment = os.environ.copy()
-        del environment["VANTAGE_CODEX_PYTHON"]
+        environment["VANTAGE_CODEX_PYTHON"] = python_path
         try:
             return subprocess.call(command, env=environment)
         except OSError:

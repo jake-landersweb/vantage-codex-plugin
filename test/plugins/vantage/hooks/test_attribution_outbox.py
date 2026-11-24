@@ -401,7 +401,7 @@ class HookTest(unittest.TestCase):
         path = folder / f"rollout-{session}.jsonl"
         row = {
             "type": "token_usage_record",
-            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "payload": {
                 "thread_id": session,
                 "turn_id": "a",

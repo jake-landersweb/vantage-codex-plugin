@@ -38,8 +38,14 @@ the updated hooks to apply the shell and edit tool filter.
 The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
-TLS and OTLP/gRPC. The bundled tools start with `python3` on `PATH` and require
-Python 3.9+ and curl with HTTP/2 support.
+TLS and OTLP/gRPC. Setup requires Python 3.9+ with SQLite and TLS 1.3 support,
+and curl with HTTP/2 support.
+
+On macOS, the MCP server checks common Homebrew and python.org locations
+when the default Python lacks TLS 1.3. The hook launcher uses `python3` from
+`PATH` and checks those locations on macOS when it resolves to
+`/usr/bin/python3`. To use a specific installation, set
+`VANTAGE_CODEX_PYTHON` to its full executable path.
 
 On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
 and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
@@ -53,6 +59,10 @@ Keep `CODEX_HOME` in a private directory in your Windows user profile so
 credentials inherit its access permissions.
 
 ## What gets recorded
+
+Repository, worktree, branch, and commit attribution use Git. If Git is
+unavailable, setup shows a warning and continues.
+Usage reporting and classifier tags can still work.
 
 Each user prompt opens a turn snapshot. The hook captures Git and developer
 identity observations (including the effective Git `user.name` and `user.email`), model request fingerprints, and classifier tags. Setup
@@ -80,17 +90,29 @@ whose hooks never fired. Billing continues to use native usage.
 
 ## Measuring the outbox
 
-From the same Codex home, inspect queued evidence or request recovery:
+On macOS and Linux, use the installed hook launcher to inspect queued
+evidence or request recovery.
 
 ```sh
-python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" status
-python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" recover
+sh "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.sh" status
+sh "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.sh" recover
 ```
 
+On Windows, run the Python launcher from PowerShell.
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+python3 -I "$codexHome/vantage/hooks/run_vantage_codex_hook.py" status
+python3 -I "$codexHome/vantage/hooks/run_vantage_codex_hook.py" recover
+```
+
+`python_executable` reports the interpreter running the hook status command.
 Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
 `pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,
 `retry_in_seconds`, and the cumulative `rollout_io_errors` (absent means zero).
+Classifier refresh failures count toward `classifier_cert_error` when
+certificate verification fails and `classifier_tls_error` for other TLS errors.
 The outbox counts unacknowledged events. A backlog that grows across turns
 while acknowledgements advance indicates the sender is falling behind.
 A stalled acknowledgement with increasing failures indicates a delivery

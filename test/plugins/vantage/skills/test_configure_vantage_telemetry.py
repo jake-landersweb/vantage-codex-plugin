@@ -6,8 +6,11 @@ import io
 import json
 import os
 import pathlib
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import unittest
 from unittest import mock
@@ -38,13 +41,59 @@ class Response:
 
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
+    def setUp(self):
+        # Setup tests should not depend on the machine's curl or Python build.
+        patcher = mock.patch.object(MODULE, "requirement_problems", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(MODULE, "requirement_warnings", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_tls_request_failure_reports_actionable_guidance(self):
+        errors = [
+            ("TLSV1_ALERT_PROTOCOL_VERSION", ssl.SSLError, MODULE.TLS_ERROR_EXIT, "lacks TLS 1.3"),
+            ("UNSUPPORTED_PROTOCOL", ssl.SSLError, MODULE.TLS_ERROR_EXIT, "lacks TLS 1.3"),
+            ("CERTIFICATE_VERIFY_FAILED", ssl.SSLCertVerificationError, MODULE.CERTIFICATE_ERROR_EXIT, "SSL_CERT_FILE"),
+            ("SSLV3_ALERT_HANDSHAKE_FAILURE", ssl.SSLError, 2, "Could not complete Vantage setup"),
+        ]
+        for reason, error_class, exit_code, message in errors:
+            for failed_request in ("claim", "ingest"):
+                for wrapped in (False, True):
+                    with self.subTest(reason=reason, failed_request=failed_request, wrapped=wrapped):
+                        error = error_class(reason)
+                        error.reason = reason
+                        if wrapped:
+                            error = urllib.error.URLError(error)
+                        self.assert_setup_request_failure(failed_request, error, exit_code, message)
+
+    def assert_setup_request_failure(self, failed_request, error, exit_code, message):
+        responses = [error]
+        if failed_request == "ingest":
+            responses.insert(0, Response(200, self.setup_payload()))
+        with tempfile.TemporaryDirectory() as codex_home, \
+                mock.patch.dict(os.environ, CODEX_HOME=codex_home), \
+                mock.patch.object(sys, "argv", ["setup"]), \
+                mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", time.time() + 60)), \
+                mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=responses), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(exit_code, MODULE.main())
+            self.assertFalse((pathlib.Path(codex_home) / "config.toml").exists())
+        self.assertIn(message, stderr.getvalue())
+        if exit_code != MODULE.TLS_ERROR_EXIT:
+            self.assertNotIn("lacks TLS 1.3", stderr.getvalue())
+
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
         profile_variable = "USERPROFILE" if os.name == "nt" else "HOME"
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {profile_variable: home, "CODEX_HOME": ""}), mock.patch.object(sys, "argv", ["setup"]):
-            with mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
+            stderr = io.StringIO()
+            with mock.patch.object(MODULE, "requirement_warnings", return_value=["git_attribution"]), \
+                    contextlib.redirect_stderr(stderr), \
+                    mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
                 MODULE, "wait_for_setup_credentials", return_value=self.setup_credentials()
             ), mock.patch.object(MODULE, "verify_ingest_token"):
                 self.assertEqual(MODULE.main(), 0)
+            self.assertIn("warning:git_attribution", stderr.getvalue())
             root = pathlib.Path(home) / ".codex"
             config = (root / "config.toml").read_text()
             connection = root / "vantage/connection.json"
@@ -480,6 +529,113 @@ exporter = { otlp-http = { endpoint = "https://ingest-staging.vantage.sh/v1/logs
 
             self.assertEqual("{invalid", hooks_path.read_text(encoding="utf-8"))
             self.assertFalse((pathlib.Path(codex_home) / "vantage").exists())
+
+class RequirementChecksTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(ssl, "HAS_TLSv1_3", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def curl_version(features):
+        completed = mock.Mock(stdout="curl 8.5.0\nProtocols: http https\nFeatures: %s\n" % features)
+        return mock.Mock(return_value=completed)
+
+    def test_ready_machine_has_no_problems(self):
+        problems = MODULE.requirement_problems(
+            version=(3, 11), os_name="posix", which=lambda _: "/usr/bin/curl",
+            run=self.curl_version("alt-svc HTTP2 HTTPS-proxy IPv6 SSL"),
+        )
+        self.assertEqual([], problems)
+
+    def test_reports_old_python(self):
+        problems = MODULE.requirement_problems(
+            version=(3, 8), os_name="posix", which=lambda _: "/usr/bin/curl",
+            run=self.curl_version("HTTP2"),
+        )
+        self.assertEqual(["python_version"], problems)
+
+    def test_reports_missing_curl(self):
+        problems = MODULE.requirement_problems(version=(3, 11), os_name="posix", which=lambda _: None)
+        self.assertEqual(["curl_missing"], problems)
+
+    def test_reports_curl_without_http2(self):
+        problems = MODULE.requirement_problems(
+            version=(3, 11), os_name="posix", which=lambda _: "/usr/bin/curl",
+            run=self.curl_version("alt-svc IPv6 SSL"),
+        )
+        self.assertEqual(["curl_http2"], problems)
+
+    def test_reports_curl_that_cannot_run(self):
+        problems = MODULE.requirement_problems(
+            version=(3, 11), os_name="posix", which=lambda _: "/usr/bin/curl",
+            run=mock.Mock(side_effect=OSError("broken")),
+        )
+        self.assertEqual(["curl_http2"], problems)
+
+    def test_windows_checks_the_configured_curl(self):
+        executable = r"C:\Tools\curl.exe"
+        which = mock.Mock(return_value=executable)
+        run = self.curl_version("HTTP2")
+        with mock.patch.dict(os.environ, VANTAGE_CODEX_CURL=executable):
+            problems = MODULE.requirement_problems(version=(3, 11), os_name="nt", which=which, run=run)
+        self.assertEqual([], problems)
+        which.assert_called_once_with(executable)
+        self.assertEqual([executable, "-V"], run.call_args.args[0])
+
+    def test_git_warning_uses_version_and_handles_missing_git(self):
+        for stdout, expected in [
+            ("git version 2.30.9\n", []),
+            ("git version 2.31.0\n", []),
+            ("git version 2.39.5 (Apple Git-154)\n", []),
+            ("git version 2.52.0.windows.1\n", []),
+        ]:
+            with self.subTest(stdout=stdout):
+                run = mock.Mock(return_value=mock.Mock(stdout=stdout, returncode=0))
+                self.assertEqual(expected, MODULE.requirement_warnings(run=run))
+        self.assertEqual(["git_attribution"], MODULE.requirement_warnings(run=mock.Mock(side_effect=FileNotFoundError)))
+
+    def test_setup_stops_before_sign_in_when_requirements_are_missing(self):
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as codex_dir, mock.patch.dict(os.environ, CODEX_HOME=codex_dir), \
+                mock.patch.object(sys, "argv", ["setup"]), \
+                mock.patch.object(MODULE, "requirement_problems", return_value=["curl_missing"]), \
+                mock.patch.object(MODULE, "browser_sign_in") as sign_in, contextlib.redirect_stderr(stderr):
+            self.assertEqual(MODULE.MISSING_REQUIREMENTS_EXIT, MODULE.main())
+            self.assertFalse((pathlib.Path(codex_dir) / "config.toml").exists())
+        sign_in.assert_not_called()
+        self.assertIn("requirement:curl_missing ", stderr.getvalue())
+
+    def test_setup_reports_python_tls_before_sign_in(self):
+        check_requirements = MODULE.requirement_problems
+        with mock.patch.object(ssl, "HAS_TLSv1_3", False), \
+                mock.patch.object(sys, "argv", ["setup"]), \
+                mock.patch.object(MODULE, "requirement_problems", side_effect=lambda: check_requirements(
+                    which=lambda _: "/usr/bin/curl", run=self.curl_version("HTTP2")
+                )), \
+                mock.patch.object(MODULE, "browser_sign_in") as sign_in, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(MODULE.MISSING_REQUIREMENTS_EXIT, MODULE.main())
+        sign_in.assert_not_called()
+        self.assertIn("requirement:python_tls ", stderr.getvalue())
+        self.assertIn("lacks TLS 1.3", stderr.getvalue())
+
+    def test_remove_works_even_when_requirements_are_missing(self):
+        with tempfile.TemporaryDirectory() as codex_dir, mock.patch.dict(os.environ, CODEX_HOME=codex_dir), \
+                mock.patch.object(sys, "argv", ["setup", "--remove"]), \
+                mock.patch.object(MODULE, "requirement_problems", return_value=["curl_missing"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, MODULE.main())
+
+    def test_check_requirements_flag_reports_success_without_sign_in(self):
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["setup", "--check-requirements"]), \
+                mock.patch.object(MODULE, "requirement_problems", return_value=[]), \
+                mock.patch.object(MODULE, "browser_sign_in") as sign_in, contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, MODULE.main())
+        sign_in.assert_not_called()
+        self.assertIn("All Vantage telemetry requirements", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
