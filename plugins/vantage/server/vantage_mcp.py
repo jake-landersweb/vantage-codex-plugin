@@ -2,7 +2,9 @@
 """Dependency-free local MCP tools for Vantage telemetry setup."""
 
 import json
+import os
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -314,7 +316,66 @@ def tool_definitions():
                 "openWorldHint": False,
             },
         },
+        {
+            "name": "set_turn_attribution",
+            "description": "Replace the classifier tags for the Codex turn identified by the Vantage hook.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "turn_id": {"type": "string"},
+                    "tags": {"type": "object", "additionalProperties": {"type": "string"}, "maxProperties": 32},
+                },
+                "required": ["session_id", "turn_id", "tags"],
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+        },
     ]
+
+
+def set_turn_attribution(arguments):
+    if set(arguments) != {"session_id", "turn_id", "tags"}:
+        raise ValueError("expected session_id, turn_id, and tags")
+    ids = [arguments["session_id"], arguments["turn_id"]]
+    if not all(isinstance(i, str) and re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.:/-]{0,179}", i) for i in ids):
+        raise ValueError("invalid session or turn identifier")
+    tags = arguments["tags"]
+    if not isinstance(tags, dict) or len(tags) > 32:
+        raise ValueError("tags must be an object with at most 32 dimensions")
+    assignments = []
+    for key, value in tags.items():
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", key) or not isinstance(value, str):
+            raise ValueError("invalid classifier dimension")
+        if not 1 <= len(value) <= 512 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("invalid classifier value")
+        assignments.append(f"{key}={value}")
+    codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+    launcher = codex_home / "vantage" / "hooks" / "run_vantage_codex_hook.py"
+    command = [sys.executable, "-I", str(launcher),
+               "tag", "codex", *ids, "--source", "inferred", "--replace", *assignments]
+    try:
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        saved = completed.returncode == 0
+        errors = completed.stderr.rstrip().splitlines()
+        last_error = errors[-1] if errors else b""
+    except subprocess.TimeoutExpired:
+        saved = False
+        last_error = b"timeout"
+    except OSError:
+        saved = False
+        last_error = b""
+    if saved:
+        message = "Turn attribution saved."
+    elif last_error == b"unknown turn" or last_error.endswith(b": error: unknown turn"):
+        message = "Vantage could not find that turn. Use the session and turn IDs from the current Vantage hook."
+    elif last_error == b"timeout":
+        message = "Saving turn attribution timed out."
+    elif last_error in {b"Run Vantage telemetry setup first.", b"Vantage attribution hook is not installed."} or not launcher.is_file():
+        message = "Set up Vantage telemetry before saving attribution."
+    else:
+        message = "Could not save turn attribution. Check local telemetry setup."
+    return {"content": [{"type": "text", "text": message}], "isError": not saved}
 
 
 def call_tool(params, runner=run_tool_action):
@@ -324,6 +385,8 @@ def call_tool(params, runner=run_tool_action):
     arguments = params.get("arguments", {})
     if not isinstance(arguments, dict):
         raise ValueError("tool arguments must be an object")
+    if name == "set_turn_attribution":
+        return set_turn_attribution(arguments)
     actions = {
         "connect_vantage_telemetry": "start",
         "check_vantage_telemetry_setup": "status",
@@ -468,5 +531,23 @@ def serve(input_stream=None, output_stream=None, runner=run_tool_action):
         stop_active_setup()
 
 
-if __name__ == "__main__":
+def main():
+    python_path = os.environ.get("VANTAGE_CODEX_PYTHON")
+    if python_path and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+        command = [python_path, "-I", str(pathlib.Path(__file__).resolve())]
+        environment = os.environ.copy()
+        del environment["VANTAGE_CODEX_PYTHON"]
+        try:
+            return subprocess.call(command, env=environment)
+        except OSError:
+            print("Vantage could not start the Python interpreter set by VANTAGE_CODEX_PYTHON.", file=sys.stderr)
+            return 4
+    if sys.version_info < (3, 9):
+        print("Vantage telemetry requires Python 3.9 or newer.", file=sys.stderr)
+        return 4
     serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

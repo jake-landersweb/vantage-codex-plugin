@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import secrets
+import runpy
 import shlex
 import subprocess
 import sys
@@ -22,15 +23,13 @@ import webbrowser
 
 BEGIN = "# BEGIN Vantage telemetry (managed by the Vantage plugin; rerun setup to change it)"
 END = "# END Vantage telemetry"
-INGEST_ENDPOINT = os.environ.get("VANTAGE_CODEX_INGEST_ENDPOINT", "https://ingest.vantage.sh/v1/logs")
+INGEST_ENDPOINT = os.environ.get("VANTAGE_CODEX_INGEST_ENDPOINT", "https://ingest-staging.vantage.sh/v1/logs")
 CLAIM_ENDPOINT = os.environ.get(
-    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.vantage.sh/plugins/codex_telemetry_setup/claim"
+    "VANTAGE_CODEX_CLAIM_ENDPOINT", "https://api.staging.vantage.sh/plugins/codex_telemetry_setup/claim"
 )
 AUTHORIZATION_ENDPOINT = os.environ.get(
-    "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console.vantage.sh/codex/telemetry/authorize"
+    "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console-staging.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.4.1"
-USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
@@ -48,6 +47,13 @@ OTEL_TABLE = re.compile(r"^\s*\[\s*otel\s*\]\s*(?:#.*)?$")
 OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
+try:
+    PLUGIN_VERSION = json.loads((PLUGIN_ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+except (OSError, ValueError, TypeError, KeyError):
+    PLUGIN_VERSION = "unknown"
+if not isinstance(PLUGIN_VERSION, str) or not PLUGIN_VERSION:
+    PLUGIN_VERSION = "unknown"
+USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 
@@ -92,8 +98,8 @@ def hook_handler(event_name):
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["python", "-I", str(python_script)]),
-        "timeout": 30,
+        "commandWindows": subprocess.list2cmdline(["python3", "-I", str(python_script)]),
+        "timeout": 3 if event_name == "SessionEnd" else 30,
         "statusMessage": (
             "Loading Vantage attribution"
             if event_name == "SessionStart"
@@ -109,9 +115,14 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
+    python_script = str(managed_hooks_dir() / "run_vantage_codex_hook.py")
+    legacy_windows = (
+        subprocess.list2cmdline(["python", "-I", python_script]),
+        subprocess.list2cmdline(["py", "-3", "-I", python_script]),
+    )
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows") == expected["commandWindows"]
+        or handler.get("commandWindows") in (expected["commandWindows"], *legacy_windows)
     )
 
 
@@ -217,12 +228,37 @@ def copy_managed_hook_scripts():
         write_file(destination / name, source.read_bytes(), mode=0o700)
 
 
+HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostModelRequest", "SubagentStart",
+               "PostToolUse", "Stop", "SessionEnd")
+POST_TOOL_MATCHER = r"^(Bash|Edit|Write|MultiEdit|exec_command|apply_patch|shell|shell_command)$"
+
+
+def save_connection(token):
+    path = classifier_directory() / "connection.json"
+    endpoint = INGEST_ENDPOINT.removesuffix("/v1/logs").rstrip("/")
+    if path.exists():
+        existing = json.loads(path.read_text())
+        if existing.get("endpoint") == endpoint and existing.get("token") == token:
+            return
+    write_file(path, json.dumps({"endpoint": endpoint, "token": token, "since_ns": time.time_ns()}).encode())
+
+
 def install_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
-    for event_name in ("SessionStart", "Stop"):
+    if "PreToolUse" in hooks:
+        remaining, changed = remove_managed_hook_handlers(hooks["PreToolUse"])
+        if changed:
+            if remaining:
+                hooks["PreToolUse"] = remaining
+            else:
+                del hooks["PreToolUse"]
+    for event_name in HOOK_EVENTS:
         groups, _changed = remove_managed_hook_handlers(hooks.get(event_name, []))
-        groups.append({"hooks": [hook_handler(event_name)]})
+        group = {"hooks": [hook_handler(event_name)]}
+        if event_name == "PostToolUse":
+            group["matcher"] = POST_TOOL_MATCHER
+        groups.append(group)
         hooks[event_name] = groups
     payload["hooks"] = hooks
 
@@ -254,7 +290,7 @@ def remove_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
     changed = False
-    for event_name in ("SessionStart", "Stop"):
+    for event_name in (*HOOK_EVENTS, "PreToolUse"):
         if event_name not in hooks:
             continue
         groups, event_changed = remove_managed_hook_handlers(hooks[event_name])
@@ -373,10 +409,10 @@ def remove_managed_settings(lines):
     return result
 
 
-def managed_block(token, include_environment):
+def managed_block(token, include_environment, *, environment="staging"):
     lines = [BEGIN]
     if include_environment:
-        lines.append('environment = "prod"')
+        lines.append('environment = "%s"' % environment)
     lines += [
         'exporter = { otlp-http = { endpoint = "%s", protocol = "binary", headers = { authorization = "Bearer %s" } } }'
         % (INGEST_ENDPOINT, token),
@@ -485,6 +521,18 @@ def wait_for_setup_credentials(code_verifier, authorization_expires_at):
         return {"ingest_token": token.strip(), "classifier": classifier_bundle(payload)}
 
 
+def verify_attribution_transport(token):
+    try:
+        hook = runpy.run_path(str(BUNDLED_HOOKS_DIR / "vantage_codex_hook.py"))
+        hook["export"]("vantage-agent-hook", [], token=token,
+                       endpoint=INGEST_ENDPOINT.removesuffix("/v1/logs").rstrip("/"))
+    except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        message = "Could not verify the authenticated gRPC logs endpoint."
+        if os.name == "nt":
+            message += " Use an HTTP/2-enabled curl.exe and set VANTAGE_CODEX_CURL to its full path."
+        raise ValueError(message) from error
+
+
 def verify_ingest_token(token):
     deadline = time.monotonic() + 5
     while True:
@@ -501,6 +549,7 @@ def verify_ingest_token(token):
         )
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT):
+                verify_attribution_transport(token)
                 return
         except urllib.error.HTTPError as error:
             if error.code in (401, 403) and time.monotonic() < deadline:
@@ -548,6 +597,7 @@ def main():
     if args.remove:
         try:
             removed_hooks = remove_user_hooks()
+            (classifier_directory() / "connection.json").unlink(missing_ok=True)
             removed_classifier = remove_classifier_files()
         except (OSError, UnicodeError, ValueError) as error:
             print("Could not remove Vantage files safely: %s" % error, file=sys.stderr)
@@ -571,7 +621,9 @@ def main():
         print("Removed Vantage telemetry from %s. Restart Codex to apply." % path)
         return 0
 
-    if configured:
+    # Reauthorize when a managed exporter targets a different environment.
+    managed_token = vantage_exporter_token(original.splitlines()) if configured else None
+    if configured and managed_token:
         if not classifier_token_path().is_file() or not classifier_markdown_path().is_file():
             print(
                 "Vantage telemetry is configured, but its classifier files are missing. Remove Vantage telemetry and connect again.",
@@ -580,6 +632,7 @@ def main():
             return 2
         if not install_user_hooks_or_report():
             return 5
+        save_connection(managed_token)
         print("Vantage telemetry is already configured in %s." % path)
         print_next_steps()
         return 0
@@ -603,6 +656,7 @@ def main():
             token = credentials["ingest_token"]
             verify_ingest_token(token)
             save_classifier(credentials["classifier"])
+            save_connection(token)
         except (OSError, UnicodeError, ValueError) as error:
             print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
             return 2
@@ -634,6 +688,7 @@ def main():
         token = credentials["ingest_token"]
         verify_ingest_token(token)
         save_classifier(credentials["classifier"])
+        save_connection(token)
     except (OSError, UnicodeError, ValueError) as error:
         print("Could not complete Vantage setup: %s" % error, file=sys.stderr)
         return 2

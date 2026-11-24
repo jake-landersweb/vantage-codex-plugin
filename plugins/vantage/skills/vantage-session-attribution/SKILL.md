@@ -1,12 +1,10 @@
 ---
 name: vantage-session-attribution
-description: Apply the current Vantage classifier when the Vantage hook supplies a classifier file and session-specific attribution command.
+description: Apply the current Vantage classifier when the Vantage hook supplies a classifier file and turn reference.
 ---
 
-Read the classifier Markdown file supplied by the Vantage hook in full. Treat it as the source of truth for classification instructions and allowed values.
+When the hook supplies current attribution, reuse it unless the task, PR, ticket, or other classification changed. An unchanged turn requires no file read or tool call.
 
-Use the exact session-specific attribution command supplied by the hook. Append only flags directed by the classifier. Do not infer allowed values or classification rules from this skill.
+When the hook requests classification or the current values need correction, read the supplied classifier Markdown in full and follow its rules and allowed values. If the hook supplies fallback dimensions, use those. Call the bundled `set_turn_attribution` MCP tool with the supplied `session_id` and `turn_id`. Pass the complete classification as the `tags` object with string values. Omitted dimensions are cleared. Pass an empty object to clear all dimensions. If the classifier describes command-line arguments, express the same dimensions as object keys and values.
 
-Apply the classifier at the beginning of substantive work and whenever the classification changes. Do not resend unchanged metadata every turn.
-
-Do not send prompts, summaries, source code, tool output, credentials, personal data, or local file paths. If the hook did not supply an attribution command, do nothing. Usage reporting continues independently.
+Do not send prompts, summaries, source code, tool output, credentials, personal data, or local file paths. If the hook did not supply a turn reference, do nothing. If Codex blocks the MCP call, report that attribution was not saved. Usage reporting continues independently.
