@@ -516,5 +516,23 @@ def serve(input_stream=None, output_stream=None, runner=run_tool_action):
         stop_active_setup()
 
 
-if __name__ == "__main__":
+def main():
+    python_path = os.environ.get("VANTAGE_CODEX_PYTHON")
+    if python_path and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+        command = [python_path, "-I", str(pathlib.Path(__file__).resolve())]
+        environment = os.environ.copy()
+        del environment["VANTAGE_CODEX_PYTHON"]
+        try:
+            return subprocess.call(command, env=environment)
+        except OSError:
+            print("Vantage could not start the Python interpreter set by VANTAGE_CODEX_PYTHON.", file=sys.stderr)
+            return 4
+    if sys.version_info < (3, 9):
+        print("Vantage telemetry requires Python 3.9 or newer.", file=sys.stderr)
+        return 4
     serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

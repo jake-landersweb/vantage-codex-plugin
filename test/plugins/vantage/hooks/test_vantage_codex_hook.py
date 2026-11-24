@@ -13,6 +13,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "plugins/vantage/hooks/vantage_codex_hook.py"
+LAUNCHER = (
+    [sys.executable, "-I", str(SCRIPT.with_name("run_vantage_codex_hook.py"))]
+    if os.name == "nt" else ["sh", str(SCRIPT.with_name("run_vantage_codex_hook.sh"))]
+)
 SPEC = importlib.util.spec_from_file_location("vantage_codex_hook", SCRIPT)
 assert SPEC and SPEC.loader
 HOOK = importlib.util.module_from_spec(SPEC)
@@ -88,6 +92,7 @@ class VantageCodexHookTest(unittest.TestCase):
             (codex_home / "vantage" / "classifier.etag").read_text(encoding="utf-8"),
         )
 
+    @unittest.skipIf(os.name == "nt", "the POSIX hook launcher is a shell script")
     def test_launcher_skips_the_hook_when_python_is_unavailable(self):
         launcher = SCRIPT.parent / "run_vantage_codex_hook.sh"
         environment = os.environ.copy()
@@ -112,7 +117,6 @@ class VantageCodexHookTest(unittest.TestCase):
         self.assertEqual("", result.stderr)
 
     def test_launcher_resolves_an_explicit_plugin_root(self):
-        launcher = SCRIPT.parent / "run_vantage_codex_hook.sh"
         environment = os.environ.copy()
         environment.pop("PLUGIN_ROOT", None)
         codex_home = self.directory / "codex"
@@ -126,7 +130,7 @@ class VantageCodexHookTest(unittest.TestCase):
         )
 
         result = subprocess.run(
-            ["sh", str(launcher)],
+            LAUNCHER,
             input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "session-1", "turn_id":"turn-1"}),
             env=environment,
             capture_output=True,
@@ -169,7 +173,7 @@ class VantageCodexHookTest(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            ["sh", str(SCRIPT.parent / "run_vantage_codex_hook.sh")],
+            LAUNCHER,
             input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "session-1", "turn_id":"turn-1"}),
             env=environment,
             capture_output=True,
@@ -208,7 +212,7 @@ class VantageCodexHookTest(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            ["sh", str(SCRIPT.parent / "run_vantage_codex_hook.sh")],
+            LAUNCHER,
             input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "session-1", "turn_id":"turn-1"}),
             env=environment,
             capture_output=True,
@@ -248,7 +252,7 @@ class VantageCodexHookTest(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            ["sh", str(SCRIPT.parent / "run_vantage_codex_hook.sh")],
+            LAUNCHER,
             input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "session-1", "turn_id":"turn-1"}),
             env=environment,
             capture_output=True,

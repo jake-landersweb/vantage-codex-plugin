@@ -15,8 +15,10 @@ from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
-SCRIPT = ROOT / "plugins/vantage/server/vantage_mcp.py"
-LAUNCHER = ROOT / "plugins/vantage/server/run_vantage_mcp.sh"
+PLUGIN_ROOT = ROOT / "plugins/vantage"
+SCRIPT = PLUGIN_ROOT / "server/vantage_mcp.py"
+LAUNCHER = SCRIPT.with_name("run_vantage_mcp.sh")
+MCP_SERVER = json.loads((PLUGIN_ROOT / "mcp.json").read_text(encoding="utf-8"))["mcpServers"]["vantage_local"]
 SPEC = importlib.util.spec_from_file_location("vantage_mcp", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
@@ -77,17 +79,15 @@ class VantageMcpTest(unittest.TestCase):
 
         environment = os.environ.copy()
         environment.pop("PLUGIN_ROOT", None)
-        environment.update(
-            {
-                "VANTAGE_CODEX_PYTHON": sys.executable,
-            }
-        )
+        environment.pop("VANTAGE_CODEX_PYTHON", None)
+        args = [arg.replace("${PLUGIN_ROOT}", str(PLUGIN_ROOT)) for arg in MCP_SERVER["args"]]
         completed = subprocess.run(
-            ["sh", str(LAUNCHER)],
+            [MCP_SERVER["command"], *args],
             input="".join(json.dumps(message) + "\n" for message in messages),
             capture_output=True,
             check=False,
             env=environment,
+            cwd=PLUGIN_ROOT,
             text=True,
             timeout=5,
         )
@@ -100,6 +100,7 @@ class VantageMcpTest(unittest.TestCase):
             "connect_vantage_telemetry",
             responses[1]["result"]["tools"][0]["name"],
         )
+        self.assertIn("set_turn_attribution", {tool["name"] for tool in responses[1]["result"]["tools"]})
 
     def test_launcher_reports_a_missing_python_interpreter(self):
         environment = os.environ.copy()
@@ -110,18 +111,22 @@ class VantageMcpTest(unittest.TestCase):
             }
         )
 
-        completed = subprocess.run(
-            ["sh", str(LAUNCHER)],
-            capture_output=True,
-            check=False,
-            env=environment,
-            text=True,
-            timeout=5,
-        )
-
-        self.assertEqual(4, completed.returncode)
-        self.assertEqual("", completed.stdout)
-        self.assertIn("requires Python 3", completed.stderr)
+        commands = [([sys.executable, "-I", str(SCRIPT)], "VANTAGE_CODEX_PYTHON")]
+        if os.name != "nt":
+            commands.append((["sh", str(LAUNCHER)], "requires Python 3"))
+        for command, message in commands:
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(4, completed.returncode)
+                self.assertEqual("", completed.stdout)
+                self.assertIn(message, completed.stderr)
 
     def test_negotiates_legacy_protocol_and_lists_deterministic_tools(self):
         messages = [
@@ -545,12 +550,10 @@ class VantageMcpTest(unittest.TestCase):
         self.assertIn(expected, hook)
         self.assertIn(expected, setup)
 
-        mcp = json.loads((ROOT / "plugins/vantage/mcp.json").read_text(encoding="utf-8"))
-        server = mcp["mcpServers"]["vantage_local"]
-        self.assertEqual("stdio", server["type"])
-        self.assertEqual("sh", server["command"])
-        self.assertEqual(["${PLUGIN_ROOT}/server/run_vantage_mcp.sh"], server["args"])
-        self.assertEqual("${PLUGIN_ROOT}", server["cwd"])
+        self.assertEqual("stdio", MCP_SERVER["type"])
+        self.assertEqual("python3", MCP_SERVER["command"])
+        self.assertEqual(["-I", "${PLUGIN_ROOT}/server/vantage_mcp.py"], MCP_SERVER["args"])
+        self.assertEqual("${PLUGIN_ROOT}", MCP_SERVER["cwd"])
 
 
 if __name__ == "__main__":

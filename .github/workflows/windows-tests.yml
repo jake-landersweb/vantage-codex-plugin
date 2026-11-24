@@ -14,8 +14,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Add Git for Windows shell
-        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:ProgramFiles\Git\bin"
+      - name: Expose the bundled MCP command
+        run: |
+          $interpreter = (Get-Command python.exe).Source
+          $aliasPath = Join-Path (Split-Path $interpreter) 'python3.exe'
+          if (!(Test-Path $aliasPath)) { Copy-Item $interpreter $aliasPath }
       - name: Run Python tests
         run: |
           Get-ChildItem test -Recurse -Filter 'test_*.py' | ForEach-Object {
