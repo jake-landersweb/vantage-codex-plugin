@@ -2,6 +2,13 @@
 
 python_path="${VANTAGE_CODEX_PYTHON:-}"
 if [ -z "$python_path" ]; then
+  case "$(uname -s)" in
+    MINGW*|MSYS*)
+      if command -v py >/dev/null 2>&1; then
+        exec py -3 -I "$(dirname "$0")/vantage_mcp.py"
+      fi
+      ;;
+  esac
   python_path="$(command -v python3 2>/dev/null || true)"
 fi
 
@@ -17,4 +24,4 @@ if [ "$python_path" = "/usr/bin/python3" ] && command -v xcode-select >/dev/null
   fi
 fi
 
-exec "$python_path" "$(dirname "$0")/vantage_mcp.py"
+exec "$python_path" -I "$(dirname "$0")/vantage_mcp.py"

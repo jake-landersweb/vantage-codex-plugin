@@ -39,7 +39,8 @@ class Response:
 
 class ConfigureVantageTelemetryTest(unittest.TestCase):
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME":home, "CODEX_HOME":""}), mock.patch.object(sys, "argv", ["setup"]):
+        profile_variable = "USERPROFILE" if os.name == "nt" else "HOME"
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {profile_variable: home, "CODEX_HOME": ""}), mock.patch.object(sys, "argv", ["setup"]):
             with mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
                 MODULE, "wait_for_setup_credentials", return_value=self.setup_credentials()
             ), mock.patch.object(MODULE, "verify_ingest_token"):
@@ -51,7 +52,8 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             self.assertEqual("https://ingest-staging.vantage.sh", settings["endpoint"])
             self.assertIn(settings["endpoint"] + "/v1/logs", config)
             self.assertIn("Bearer " + settings["token"], config)
-            self.assertEqual(0o600, connection.stat().st_mode & 0o777)
+            if os.name != "nt":
+                self.assertEqual(0o600, connection.stat().st_mode & 0o777)
             self.assertEqual(MODULE.main(), 0)
             self.assertEqual(settings, json.loads(connection.read_text()))
             self.assertEqual(set(MODULE.HOOK_EVENTS), set(MODULE.load_user_hooks()["hooks"]))
@@ -273,8 +275,9 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
             self.assertEqual("classifier-token", token_path.read_text(encoding="utf-8"))
             self.assertEqual("# Current classifier\n", markdown_path.read_text(encoding="utf-8"))
-            self.assertEqual(0o600, token_path.stat().st_mode & 0o777)
-            self.assertEqual(0o600, markdown_path.stat().st_mode & 0o777)
+            if os.name != "nt":
+                self.assertEqual(0o600, token_path.stat().st_mode & 0o777)
+                self.assertEqual(0o600, markdown_path.stat().st_mode & 0o777)
 
     def test_default_command_refreshes_an_existing_vantage_exporter(self):
         config = """[otel]
@@ -362,7 +365,12 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
             with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
                 previous = json.loads(json.dumps(existing))
                 unrelated_pre_hook = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo pre"}]}
-                previous["hooks"]["PreToolUse"] = [unrelated_pre_hook, {"hooks": [MODULE.hook_handler("PreToolUse")]}]
+                legacy_windows = MODULE.subprocess.list2cmdline([
+                    "python", "-I", str(MODULE.managed_hooks_dir() / "run_vantage_codex_hook.py"),
+                ])
+                previous["hooks"]["PreToolUse"] = [unrelated_pre_hook, {
+                    "hooks": [{"type": "command", "commandWindows": legacy_windows}],
+                }]
                 previous["hooks"]["PostToolUse"].append({"hooks": [MODULE.hook_handler("PostToolUse")]})
                 hooks_path.write_text(json.dumps(previous), encoding="utf-8")
                 MODULE.install_user_hooks()
@@ -377,6 +385,7 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                 self.assertRegex("Bash", matcher)
                 self.assertRegex("apply_patch", matcher)
                 self.assertNotRegex("mcp__example__read", matcher)
+                self.assertTrue(payload["hooks"]["PostToolUse"][-1]["hooks"][0]["commandWindows"].startswith("py -3 -I "))
                 self.assertEqual("echo start", payload["hooks"]["SessionStart"][0]["hooks"][0]["command"])
                 for event_name in MODULE.HOOK_EVENTS:
                     managed = [
@@ -402,7 +411,8 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     (MODULE.BUNDLED_HOOKS_DIR / name).read_bytes(),
                     destination.read_bytes(),
                 )
-                self.assertTrue(destination.stat().st_mode & 0o100)
+                if os.name != "nt":
+                    self.assertTrue(destination.stat().st_mode & 0o100)
 
     def test_remove_user_hooks_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as codex_home:

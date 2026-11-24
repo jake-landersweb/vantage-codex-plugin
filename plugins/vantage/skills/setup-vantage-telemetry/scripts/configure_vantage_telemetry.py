@@ -93,7 +93,7 @@ def hook_handler(event_name):
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["python", "-I", str(python_script)]),
+        "commandWindows": subprocess.list2cmdline(["py", "-3", "-I", str(python_script)]),
         "timeout": 30,
         "statusMessage": (
             "Loading Vantage attribution"
@@ -110,9 +110,12 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
+    legacy_windows = subprocess.list2cmdline([
+        "python", "-I", str(managed_hooks_dir() / "run_vantage_codex_hook.py"),
+    ])
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows") == expected["commandWindows"]
+        or handler.get("commandWindows") in (expected["commandWindows"], legacy_windows)
     )
 
 
@@ -517,7 +520,10 @@ def verify_attribution_transport(token):
         hook["export"]("vantage-agent-hook", [], token=token,
                        endpoint=INGEST_ENDPOINT.removesuffix("/v1/logs").rstrip("/"))
     except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        raise ValueError("Could not verify the authenticated gRPC logs endpoint.") from error
+        message = "Could not verify the authenticated gRPC logs endpoint."
+        if os.name == "nt":
+            message += " Use an HTTP/2-enabled curl.exe and set VANTAGE_CODEX_CURL to its full path."
+        raise ValueError(message) from error
 
 
 def verify_ingest_token(token):

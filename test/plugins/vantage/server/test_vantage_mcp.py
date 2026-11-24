@@ -1,4 +1,3 @@
-import fcntl
 import hashlib
 import importlib.util
 import io
@@ -11,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from unittest import mock
 
 
@@ -21,6 +21,8 @@ SPEC = importlib.util.spec_from_file_location("vantage_mcp", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+sys.path.insert(0, str(ROOT / "plugins/vantage/hooks"))
+from vantage_codex_hook import try_lock
 
 
 def request(message_id, method, params=None):
@@ -191,8 +193,8 @@ class VantageMcpTest(unittest.TestCase):
                 "endpoint": endpoint, "token": token, "since_ns": 1,
             }))
             # Keep the test offline while exercising the same hook and writer as the server.
-            with (outbox / "worker.lock").open("a") as lock, mock.patch.object(MODULE, "PLUGIN_ROOT", older):
-                fcntl.flock(lock, fcntl.LOCK_EX)
+            with (outbox / "worker.lock").open("a+b") as lock, mock.patch.object(MODULE, "PLUGIN_ROOT", older):
+                self.assertTrue(try_lock(lock))
                 subprocess.run([sys.executable, "-I", str(launcher)],
                                input=json.dumps({"hook_event_name": "UserPromptSubmit",
                                                  "session_id": "s", "turn_id": "t"}),
@@ -202,7 +204,7 @@ class VantageMcpTest(unittest.TestCase):
                     args = {"session_id": "s", "turn_id": turn, "tags": tags}
                     result = MODULE.call_tool({"name": "set_turn_attribution", "arguments": args})
                     self.assertEqual(result["isError"], not success)
-                    with sqlite3.connect(outbox / "state.sqlite") as db:
+                    with closing(sqlite3.connect(outbox / "state.sqlite")) as db:
                         rows = db.execute("SELECT state FROM turns").fetchall()
                     self.assertEqual(len(rows), 1)
                     if success:

@@ -1,7 +1,8 @@
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import io
 import os
 import datetime
+import hashlib
 import json
 import time
 import sys
@@ -312,8 +313,8 @@ class HookTest(unittest.TestCase):
         key = ("codex", "s", "t")
         store.enqueue(self.db, store.REQUEST, key, {"status":"completed"})
         initial = self.payloads()
-        with (store.STATE / "worker.lock").open("a") as lock:
-            store.fcntl.flock(lock, store.fcntl.LOCK_EX)
+        with (store.STATE / "worker.lock").open("a+b") as lock:
+            self.assertTrue(store.try_lock(lock))
             with patch.object(store.subprocess, "Popen") as spawn:
                 for _ in range(20):
                     launch(self.db, True)
@@ -327,6 +328,35 @@ class HookTest(unittest.TestCase):
             launch(self.db, foreground=True, force=True)
         self.assertEqual(send.call_args.args[1][0][1]["event_id"], initial[0]["event_id"])
         self.assertFalse(self.payloads())
+
+    def test_detached_sender_reacquires_lock_and_retains_failed_batch(self):
+        endpoint, token = "http://127.0.0.1:1", "fixture-token"
+        binding = hashlib.sha256((endpoint + "\0" + token).encode()).hexdigest()
+        vantage = self.root / "vantage"
+        vantage.mkdir()
+        (vantage / "connection.json").write_text(json.dumps({
+            "endpoint": endpoint, "token": token, "since_ns": 1,
+        }))
+        processes = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch.object(store, "STATE", vantage / "outbox" / binding), closing(store.connect()) as db:
+            store.enqueue(db, store.REQUEST, ("codex", "s", "t"), {"status": "completed"})
+            with patch.dict(os.environ, CODEX_HOME=str(self.root),
+                            VANTAGE_CODEX_CURL=str(self.root / "missing-curl")), patch.object(
+                store.subprocess, "Popen", side_effect=spawn
+            ):
+                launch(db)
+            self.assertEqual(len(processes), 1)
+            with processes[0] as worker:
+                self.assertEqual(worker.wait(timeout=10), 0)
+            self.assertEqual(db.execute("SELECT failures FROM sender").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 1)
 
     def test_recovery_handles_partial_lines_parent_history_and_retries(self):
         session = str(uuid.uuid4())

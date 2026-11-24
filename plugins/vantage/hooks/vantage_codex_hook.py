@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vantage Codex attribution hook. Run directly with Python 3.9+ on POSIX.
+"""Vantage Codex attribution hook. Run directly with Python 3.9+.
 SQLite captures evidence. A detached copy of this script exports OTLP/gRPC.
 """
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import fcntl
+import errno
 import hashlib
 import json
 import os
@@ -30,6 +30,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 COMMON = (
     "SessionStart",
@@ -800,19 +805,20 @@ def export(service, records, *, token=None, endpoint=None):
     body = encode_logs(service, records)
     frame = b"\x00" + struct.pack(">I", len(body)) + body
     url = f"{endpoint or ENDPOINT}/opentelemetry.proto.collector.logs.v1.LogsService/Export"
-    # Keep binary data on stdin/stdout. dump-header includes HTTP/2 trailers.
-    with tempfile.TemporaryFile() as headers, tempfile.TemporaryFile() as auth:
-        auth.write(f"authorization: Bearer {token or TOKEN}\n".encode())
-        auth.seek(0)
+    # Keep the credential in stdin. curl writes HTTP/2 trailers with the headers.
+    with tempfile.TemporaryDirectory(prefix="vantage-export-") as directory:
+        directory = Path(directory)
+        (directory / "request.bin").write_bytes(frame)
+        auth = f"authorization: Bearer {token or TOKEN}\n".encode()
         args = [
-            "curl",
+            os.environ.get("VANTAGE_CODEX_CURL") or ("curl.exe" if os.name == "nt" else "curl"),
             "--disable",
             "--silent",
             "--show-error",
             "--fail",
             "--http2",
             "--header",
-            f"@/dev/fd/{auth.fileno()}",
+            "@-",
             "--max-time",
             "5",
             "--header",
@@ -820,21 +826,20 @@ def export(service, records, *, token=None, endpoint=None):
             "--header",
             "te: trailers",
             "--dump-header",
-            f"/dev/fd/{headers.fileno()}",
+            "headers.bin",
             "--data-binary",
-            "@-",
+            "@request.bin",
             url,
         ]
         reply = subprocess.run(
             args,
-            input=frame,
+            cwd=directory,
+            input=auth,
             stdout=subprocess.PIPE,
             check=True,
-            pass_fds=(headers.fileno(), auth.fileno()),
             timeout=7,
         )
-        headers.seek(0)
-        require_ack(headers.read(), reply.stdout)
+        require_ack((directory / "headers.bin").read_bytes(), reply.stdout)
 
 
 def drain(db, *, single=False):
@@ -866,6 +871,28 @@ def send_batch_if_due(db):
                    (time.time() + delay,))
 
 
+def try_lock(lock):
+    try:
+        if os.name == "nt":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            return False
+        raise
+    return True
+
+
+def release_lock(lock):
+    if os.name == "nt":
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def run_sender(db, lock):
     while True:
         requests = db.execute("SELECT session,generation FROM recovery_queue").fetchall()
@@ -888,8 +915,14 @@ def run_sender(db, lock):
                                  "(retry_at<=? AND EXISTS(SELECT 1 FROM outbox)) FROM sender",
                                  (time.time(),)).fetchone()[0]
             if not pending:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                release_lock(lock)
                 return
+
+
+def send(db):
+    with (STATE / "worker.lock").open("a+b") as lock:
+        if try_lock(lock):
+            run_sender(db, lock)
 
 
 def launch(db, recover_files=False, *, foreground=False, force=False):
@@ -902,19 +935,22 @@ def launch(db, recover_files=False, *, foreground=False, force=False):
                           (time.time(),)).fetchone()[0]
     if not runnable:
         return
-    with (STATE / "worker.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    if foreground:
+        send(db)
+        return
+    with (STATE / "worker.lock").open("a+b") as lock:
+        if not try_lock(lock):
             return
-        if foreground:
-            run_sender(db, lock)
-            return
-        subprocess.Popen(
-            [sys.executable, "-I", str(Path(__file__).resolve()), "send",
-             "--binding", STATE.name, "--lock-fd", str(lock.fileno())],
-            pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        release_lock(lock)
+    detached = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        if os.name == "nt" else {"start_new_session": True}
+    )
+    subprocess.Popen(
+        [sys.executable, "-I", str(Path(__file__).resolve()), "send", "--binding", STATE.name],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **detached,
+    )
 
 
 def installed_version():
@@ -1088,7 +1124,8 @@ def handle(db, name, payload):
 
 def main():
     global SOURCE
-    os.umask(0o077)
+    if os.name != "nt":
+        os.umask(0o077)
     try:
         load_connection()
     except (OSError, ValueError, KeyError):
@@ -1112,7 +1149,6 @@ def main():
     for action in ("recover", "flush", "status"):
         sub.add_parser(action).add_argument("--binding")
     sender = sub.add_parser("send")
-    sender.add_argument("--lock-fd", type=int, required=True)
     sender.add_argument("--binding", required=True)
     args = parser.parse_args(sys.argv[1:] or ["hook", "codex"])
     if getattr(args, "binding", None) and args.binding != STATE.name:
@@ -1176,8 +1212,7 @@ def main():
         else:
             SOURCE = "rollout"
             if args.action == "send":
-                with os.fdopen(args.lock_fd, "a") as lock:
-                    run_sender(db, lock)
+                send(db)
             else:
                 launch(db, args.action == "recover", foreground=True, force=True)
     finally:

@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import io
 import json
@@ -26,9 +27,7 @@ class VantageCodexHookTest(unittest.TestCase):
         )
         self.directory = Path(self.temporary_directory.name)
         self.state_directory = self.directory / "state"
-
-    def tearDown(self):
-        self.temporary_directory.cleanup()
+        self.addCleanup(self.temporary_directory.cleanup)
 
     def install_cached_classifier(self, codex_home, token=False):
         vantage = Path(codex_home) / "vantage"
@@ -36,7 +35,16 @@ class VantageCodexHookTest(unittest.TestCase):
         (vantage / "classifier.md").write_text(
             "# Test classifier\n", encoding="utf-8"
         )
-        (vantage / "connection.json").write_text(json.dumps({"token":"fixture-token","endpoint":"http://127.0.0.1:1","since_ns":1}))
+        endpoint, ingest_token = "http://127.0.0.1:1", "fixture-token"
+        (vantage / "connection.json").write_text(json.dumps({
+            "token": ingest_token, "endpoint": endpoint, "since_ns": 1,
+        }))
+        binding = hashlib.sha256((endpoint + "\0" + ingest_token).encode()).hexdigest()
+        outbox = vantage / "outbox" / binding
+        outbox.mkdir(parents=True)
+        lock = (outbox / "worker.lock").open("a+b")
+        self.addCleanup(lock.close)
+        self.assertTrue(HOOK.try_lock(lock))
         if token:
             (vantage / "classifier_read_token").write_text(
                 "classifier-token", encoding="utf-8"
@@ -73,7 +81,8 @@ class VantageCodexHookTest(unittest.TestCase):
         self.assertEqual('"old"', request.get_header("If-none-match"))
         classifier = codex_home / "vantage" / "classifier.md"
         self.assertEqual("# Updated classifier\n", classifier.read_text(encoding="utf-8"))
-        self.assertEqual(0o600, classifier.stat().st_mode & 0o777)
+        if os.name != "nt":
+            self.assertEqual(0o600, classifier.stat().st_mode & 0o777)
         self.assertEqual(
             '"new"',
             (codex_home / "vantage" / "classifier.etag").read_text(encoding="utf-8"),
