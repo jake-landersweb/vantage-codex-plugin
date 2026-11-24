@@ -94,7 +94,7 @@ def hook_handler(event_name):
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
         "commandWindows": subprocess.list2cmdline(["py", "-3", "-I", str(python_script)]),
-        "timeout": 30,
+        "timeout": 3 if event_name == "SessionEnd" else 30,
         "statusMessage": (
             "Loading Vantage attribution"
             if event_name == "SessionStart"

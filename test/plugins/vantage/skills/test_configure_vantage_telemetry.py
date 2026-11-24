@@ -372,6 +372,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     "hooks": [{"type": "command", "commandWindows": legacy_windows}],
                 }]
                 previous["hooks"]["PostToolUse"].append({"hooks": [MODULE.hook_handler("PostToolUse")]})
+                previous["hooks"]["SessionEnd"] = [{
+                    "hooks": [dict(MODULE.hook_handler("SessionEnd"), timeout=30)],
+                }]
                 hooks_path.write_text(json.dumps(previous), encoding="utf-8")
                 MODULE.install_user_hooks()
                 installed = pathlib.Path(codex_home) / "vantage" / "hooks"
@@ -395,6 +398,8 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                         if MODULE.is_managed_hook(handler)
                     ]
                     self.assertEqual(1, len(managed))
+                    if event_name == "SessionEnd":
+                        self.assertEqual(3, managed[0]["timeout"])
                 self.assertIn(
                     "run_vantage_codex_hook.py",
                     json.dumps(payload["hooks"]),
