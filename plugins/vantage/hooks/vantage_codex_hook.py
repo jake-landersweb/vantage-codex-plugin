@@ -1215,6 +1215,7 @@ def main():
                 db.execute("UPDATE prompt_contexts SET classified=1 WHERE agent=? AND session=? AND turn=?", key)
             launch(db, False, force=True)
         elif args.action == "status":
+            print("python_executable", sys.executable)
             for table in ("sessions", "turns", "outbox"):
                 print(table, db.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
             failures, retry_at, last_ack = db.execute("SELECT failures,retry_at,last_ack FROM sender").fetchone()

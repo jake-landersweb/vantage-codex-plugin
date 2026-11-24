@@ -42,8 +42,9 @@ TLS and OTLP/gRPC. Setup requires Python 3.9+ with SQLite and TLS 1.3 support,
 and curl with HTTP/2 support.
 
 On macOS, the MCP server checks common Homebrew and python.org locations
-when the default Python lacks TLS 1.3. The hook launcher prefers those
-locations before checking `PATH`. To use a specific installation, set
+when the default Python lacks TLS 1.3. The hook launcher uses `python3` from
+`PATH` and checks those locations on macOS when it resolves to
+`/usr/bin/python3`. To use a specific installation, set
 `VANTAGE_CODEX_PYTHON` to its full executable path.
 
 On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
@@ -89,13 +90,23 @@ whose hooks never fired. Billing continues to use native usage.
 
 ## Measuring the outbox
 
-From the same Codex home, inspect queued evidence or request recovery:
+On macOS and Linux, use the installed hook launcher to inspect queued
+evidence or request recovery.
 
 ```sh
-python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" status
-python3 -I "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.py" recover
+sh "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.sh" status
+sh "${CODEX_HOME:-$HOME/.codex}/vantage/hooks/run_vantage_codex_hook.sh" recover
 ```
 
+On Windows, run the Python launcher from PowerShell.
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+python3 -I "$codexHome/vantage/hooks/run_vantage_codex_hook.py" status
+python3 -I "$codexHome/vantage/hooks/run_vantage_codex_hook.py" recover
+```
+
+`python_executable` reports the interpreter running the hook status command.
 Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
 `pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,

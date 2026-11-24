@@ -2,18 +2,18 @@
 
 python_path="${VANTAGE_CODEX_PYTHON:-}"
 if [ -z "$python_path" ]; then
-  while IFS= read -r candidate; do
-    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-      python_path="$candidate"
-      break
-    fi
-  done <<EOF
+  python_path="$(command -v python3 2>/dev/null || true)"
+  if [ "$python_path" = "/usr/bin/python3" ] && [ "$(uname -s)" = "Darwin" ]; then
+    while IFS= read -r candidate; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        python_path="$candidate"
+        break
+      fi
+    done <<EOF
 ${VANTAGE_CODEX_PYTHON_CANDIDATES-/opt/homebrew/bin/python3
 /usr/local/bin/python3
 /Library/Frameworks/Python.framework/Versions/Current/bin/python3}
 EOF
-  if [ -z "$python_path" ]; then
-    python_path="$(command -v python3 2>/dev/null || true)"
   fi
 fi
 
@@ -30,4 +30,4 @@ fi
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 launcher="${script_dir}/run_vantage_codex_hook.py"
 [ -f "$launcher" ] || exit 0
-exec "$python_path" -I "$launcher"
+exec "$python_path" -I "$launcher" "$@"
