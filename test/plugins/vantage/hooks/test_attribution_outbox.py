@@ -117,8 +117,13 @@ class HookTest(unittest.TestCase):
 
         class Collector(BaseHTTPRequestHandler):
             def do_POST(self):
-                requests.append((self.path, self.headers["Authorization"], self.headers["Content-Type"],
-                                 self.rfile.read(int(self.headers["Content-Length"]))))
+                requests.append((
+                    self.path,
+                    self.headers["Authorization"],
+                    self.headers["Content-Type"],
+                    self.headers["User-Agent"],
+                    self.rfile.read(int(self.headers["Content-Length"])),
+                ))
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(length))
@@ -158,7 +163,10 @@ class HookTest(unittest.TestCase):
                                 with self.assertRaises((RuntimeError, OSError)):
                                     drain(self.db)
                             self.assertEqual(bool(self.payloads()), not accepted)
-                            self.assertEqual(requests[-1], ("/v1/logs", "Bearer fixture-token", proto, expected))
+                            self.assertEqual(requests[-1], (
+                                "/v1/logs", "Bearer fixture-token", proto,
+                                f"vantage-codex-plugin/{store.PLUGIN_VERSION}", expected,
+                            ))
             finally:
                 server.shutdown()
                 worker.join()

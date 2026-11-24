@@ -823,7 +823,11 @@ def export(service, records, *, token=None, endpoint=None):
         request = urllib.request.Request(
             f"{endpoint or ENDPOINT}/v1/logs",
             data=body,
-            headers={"Authorization": f"Bearer {token or TOKEN}", "Content-Type": "application/x-protobuf"},
+            headers={
+                "Authorization": f"Bearer {token or TOKEN}",
+                "Content-Type": "application/x-protobuf",
+                "User-Agent": USER_AGENT,
+            },
         )
         opener = urllib.request.build_opener(NoRedirectHandler)
         try:
