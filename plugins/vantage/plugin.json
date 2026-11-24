@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "vantage",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Configure Codex usage telemetry and attribution for Vantage.",
   "author": {
     "name": "Vantage"
@@ -20,7 +20,7 @@
         "displayName": "Vantage",
         "brandColor": "#6742D6",
         "composerIcon": "./assets/icon.png",
-        "logo": "./assets/logo.png",
+        "logo": "./assets/icon.png",
         "shortDescription": "Send Codex usage logs to Vantage",
         "longDescription": "Configure Codex to export privacy-conscious OpenTelemetry usage and attribution logs to Vantage.",
         "developerName": "Vantage",
