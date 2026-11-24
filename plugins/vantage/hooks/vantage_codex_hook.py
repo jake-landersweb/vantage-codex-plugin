@@ -16,6 +16,7 @@ import re
 import random
 import platform
 import shlex
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -33,11 +34,19 @@ from urllib.parse import urlsplit
 COMMON = (
     "SessionStart",
     "UserPromptSubmit",
-    "PreToolUse",
     "PostToolUse",
     "Stop",
     "SessionEnd",
 )
+GIT_TOOLS = {
+    "Bash", "Edit", "Write", "MultiEdit", "exec_command", "apply_patch", "shell", "shell_command",
+}
+GIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+ORIGIN_HEAD = "refs/remotes/origin/HEAD"
+GIT_LAYOUT_OVERRIDES = {
+    "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+}
 
 
 @dataclass(frozen=True)
@@ -68,22 +77,32 @@ def identifier(value):
     )
 
 
-def git_identity(cwd):
-    """Read the effective config in the agent's worktree; never inspect commit authors."""
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        return None  # No observation. Keep any earlier observation for this turn.
+def run_git(cwd, *args):
     try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "config", "--null", "--get-regexp", r"^user\.(name|email)$"],
+        return subprocess.run(
+            ["git", "-C", cwd, *args],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=0.5,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             check=False,
         )
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
-    if result.returncode not in (0, 1):
-        return None
+
+
+def git_output(cwd, *args):
+    result = run_git(cwd, *args)
+    return result.stdout.strip() if result and result.returncode == 0 else ""
+
+
+def git_config(cwd):
+    result = run_git(
+        cwd, "config", "--null", "--get-regexp",
+        r"^(user\.(name|email)|include\.path|includeif\..*\.path)$",
+    )
+    if not result or result.returncode not in (0, 1):
+        return None, False
     fields = dict(entry.split("\n", 1) for entry in result.stdout.split("\0") if "\n" in entry)
     email = fields.get("user.email", "")
     name = fields.get("user.name", "").strip()
@@ -91,49 +110,197 @@ def git_identity(cwd):
         email = ""
     if len(name.encode()) > 256 or not name.isprintable():
         name = ""
-    return email, name
+    return (email, name), not any(key.startswith("include") for key in fields)
 
 
-def git_facts(cwd, salt):
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        return {}
-
-    def git(*args):
-        p = subprocess.run(
-            ["git", "-C", cwd, *args],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        return p.stdout.strip() if p.returncode == 0 else ""
-
+def repository_name(remote):
+    if "://" not in remote:
+        remote = re.sub(r"^([\w.-]+@)?([\w.-]+):", r"ssh://\2/", remote)
     try:
-        worktree = git("rev-parse", "--absolute-git-dir")
-        if not worktree:
-            return {}
-        facts = {
-            "worktree": hashlib.sha256(salt + os.fsencode(worktree)).hexdigest(),
-            "branch": git("symbolic-ref", "--short", "-q", "HEAD"),
-            "head": git("rev-parse", "--verify", "HEAD"),
-        }
-        default_ref = git("symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
-        if default_ref.startswith("origin/") and facts["branch"]:
-            facts["branch_is_default"] = facts["branch"] == default_ref.removeprefix(
-                "origin/"
-            )
-        remote = git("remote", "get-url", "origin")
-        if "://" not in remote:
-            remote = re.sub(r"^([\w.-]+@)?([\w.-]+):", r"ssh://\2/", remote)
         url = urlsplit(remote)
         if url.hostname and url.scheme in {"https", "http", "ssh", "git"}:
             repo = url.path.strip("/").removesuffix(".git")
             parts = repo.split("/")
             if len(parts) >= 2 and re.fullmatch(r"[\w./-]+", repo) and not any(part in {"", ".", ".."} for part in parts):
-                facts["repository"] = f"{url.hostname}/{repo}"
-        return facts
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return {}
+                return f"{url.hostname}/{repo}"
+    except ValueError:
+        pass
+    return ""
+
+
+def git_layout(cwd):
+    # Let Git handle explicit environment overrides and nonstandard repositories.
+    if GIT_LAYOUT_OVERRIDES.intersection(os.environ) or any(key.startswith("GIT_CONFIG") for key in os.environ):
+        return None
+    path = Path(cwd).resolve()
+    if not path.is_dir():
+        return None
+    for directory in (path, *path.parents):
+        marker = directory / ".git"
+        if marker.is_dir():
+            git_dir = marker.resolve()
+        elif marker.is_file():
+            pointer = marker.read_text().strip()
+            if not pointer.startswith("gitdir: "):
+                return None
+            git_dir = (directory / pointer.removeprefix("gitdir: ")).resolve()
+        else:
+            continue
+        common_file = git_dir / "commondir"
+        common_dir = (
+            (git_dir / common_file.read_text().strip()).resolve()
+            if common_file.is_file() else git_dir
+        )
+        return git_dir, common_dir
+    return None
+
+
+def file_stamp(path):
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+
+def git_head_stamp(git_dir, common_dir):
+    if (common_dir / "reftable").exists():
+        return None
+    head = git_dir / "HEAD"
+    stamp = file_stamp(head)
+    if stamp is None or head.is_symlink():
+        return None
+    value = head.read_text().strip()
+    if GIT_OID.fullmatch(value):
+        return ["", stamp]
+    if not value.startswith("ref: refs/heads/"):
+        return None
+    ref = Path(value.removeprefix("ref: "))
+    if ".." in ref.parts:
+        return None
+    loose = common_dir / ref
+    ref_stamp = file_stamp(loose)
+    if ref_stamp is not None and not GIT_OID.fullmatch(loose.read_text().strip()):
+        return None
+    return [
+        ref.as_posix().removeprefix("refs/heads/"), stamp, ref_stamp,
+        file_stamp(common_dir / "packed-refs") if ref_stamp is None else None,
+    ]
+
+
+def git_config_stamp(git_dir, common_dir):
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    files = [
+        common_dir / "config", git_dir / "config.worktree",
+        Path.home() / ".gitconfig", xdg / "git" / "config", Path("/etc/gitconfig"),
+        common_dir / ORIGIN_HEAD,
+    ]
+    executable = shutil.which("git")
+    if executable:
+        files.append(Path(executable).resolve().parent.parent / "etc/gitconfig")
+    return [file_stamp(path) for path in files]
+
+
+def git_default_ref(cwd, layout):
+    if layout and not (layout[1] / "reftable").exists():
+        try:
+            path = layout[1] / ORIGIN_HEAD
+            ref = path.read_text().strip() if path.is_file() else ""
+            if not ref or GIT_OID.fullmatch(ref):
+                return "", True
+            if ref.startswith("ref: refs/remotes/origin/"):
+                target = ref.removeprefix("ref: ")
+                if ".." not in Path(target).parts:
+                    target_file = layout[1] / target
+                    if not target_file.is_file() or GIT_OID.fullmatch(target_file.read_text().strip()):
+                        return target.removeprefix("refs/remotes/"), True
+        except (OSError, ValueError):
+            pass
+    return git_output(cwd, "symbolic-ref", "--short", "-q", ORIGIN_HEAD), False
+
+
+def git_observation(db, cwd, salt, *, observe=True):
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return {}, None
+    layout = head_stamp = config_stamp = None
+    cached = {}
+    try:
+        layout = git_layout(cwd)
+        if layout:
+            head_stamp = git_head_stamp(*layout)
+            config_stamp = git_config_stamp(*layout)
+            key = hashlib.sha256(salt + os.fsencode(layout[0])).hexdigest()
+            row = db.execute("SELECT state FROM git_worktrees WHERE worktree=?", (key,)).fetchone()
+            if row:
+                cached = json.loads(row[0])
+    except (OSError, ValueError, RuntimeError):
+        layout = head_stamp = config_stamp = None
+
+    if not layout and not observe:
+        return {}, git_config(cwd)[0]
+
+    same_head = head_stamp is not None and head_stamp == cached.get("head_stamp")
+    if same_head:
+        facts = cached["facts"]
+    else:
+        # Git still resolves the commit, including packed refs and linked worktrees.
+        result = run_git(
+            cwd, "rev-parse", "--path-format=absolute", "--absolute-git-dir",
+            "--git-common-dir", "HEAD", "--symbolic-full-name", "HEAD",
+        )
+        fields = result.stdout.splitlines() if result else []
+        if len(fields) < 2 or not all(os.path.isabs(path) for path in fields[:2]):
+            return {}, git_config(cwd)[0]
+        git_dir, common_dir = fields[:2]
+        try:
+            if layout != (Path(git_dir).resolve(), Path(common_dir).resolve()):
+                layout = head_stamp = config_stamp = None
+        except (OSError, RuntimeError):
+            layout = head_stamp = config_stamp = None
+        worktree = hashlib.sha256(salt + os.fsencode(git_dir)).hexdigest()
+        head = fields[2] if result.returncode == 0 and len(fields) >= 3 and GIT_OID.fullmatch(fields[2]) else ""
+        symbol = fields[3] if len(fields) == 4 else ""
+        if symbol == "HEAD" or symbol.startswith("refs/heads/"):
+            branch = symbol.removeprefix("refs/heads/") if symbol != "HEAD" else ""
+        elif head_stamp is not None and not head:
+            branch = head_stamp[0]
+        else:
+            branch = git_output(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+        facts = {"worktree": worktree, "branch": branch, "head": head}
+        if result.returncode != 0 and fields[2:] != ["HEAD"]:
+            head_stamp = None
+
+    same_config = config_stamp is not None and config_stamp == cached.get("config_stamp")
+    if same_config:
+        identity, remote, default_ref = cached["metadata"]
+        identity = tuple(identity)
+    else:
+        identity, cache_config = git_config(cwd)
+        remote_result = run_git(cwd, "remote", "get-url", "origin")
+        remote = repository_name(remote_result.stdout.strip()) if remote_result and remote_result.returncode == 0 else ""
+        default_ref, cache_default = git_default_ref(cwd, layout)
+        if not cache_config or not cache_default or remote_result is None:
+            config_stamp = None
+
+    if layout and not (same_head and same_config):
+        try:
+            if head_stamp != git_head_stamp(*layout):
+                head_stamp = None
+            if config_stamp != git_config_stamp(*layout):
+                config_stamp = None
+        except (OSError, ValueError):
+            head_stamp = config_stamp = None
+        if head_stamp is not None or config_stamp is not None:
+            state = {"head_stamp": head_stamp, "facts": facts,
+                     "config_stamp": config_stamp, "metadata": [identity, remote, default_ref]}
+            db.execute("INSERT OR REPLACE INTO git_worktrees VALUES (?,?)", (key, json.dumps(state)))
+
+    facts = dict(facts)
+    if default_ref.startswith("origin/") and facts["branch"]:
+        facts["branch_is_default"] = facts["branch"] == default_ref.removeprefix("origin/")
+    if remote:
+        facts["repository"] = remote
+    return facts, identity
 
 
 REQUEST = "vantage.request_correlation"
@@ -303,6 +470,7 @@ def connect():
         CREATE TABLE IF NOT EXISTS git_names (
             agent TEXT, session TEXT, turn TEXT, at_ns INTEGER, name TEXT NOT NULL,
             PRIMARY KEY(agent, session, turn, at_ns));
+        CREATE TABLE IF NOT EXISTS git_worktrees (worktree TEXT PRIMARY KEY, state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS install (id INTEGER PRIMARY KEY, salt BLOB NOT NULL);
         INSERT OR IGNORE INTO install VALUES (1,randomblob(16));
         CREATE TABLE IF NOT EXISTS diagnostics (name TEXT PRIMARY KEY, count INTEGER);
@@ -815,6 +983,8 @@ def handle(db, name, payload):
     turn = identifier(payload.get(agent.turn_field))
     if not session or event not in agent.events:
         return
+    if event == "PostToolUse" and payload.get("tool_name") not in GIT_TOOLS:
+        return
     if event == "SessionStart":
         refresh_classifier(os.environ)
     SOURCE = event
@@ -826,18 +996,6 @@ def handle(db, name, payload):
     key = (name, session, turn)
     now = time.time_ns()
     home = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve())
-    tool = event in ("PreToolUse", "PostToolUse")
-    if tool and payload.get("tool_name") not in {
-        "Bash",
-        "Edit",
-        "Write",
-        "MultiEdit",
-        "exec_command",
-        "apply_patch",
-        "shell",
-        "shell_command",
-    }:
-        return
     first = (
         turn
         and not db.execute(
@@ -845,13 +1003,12 @@ def handle(db, name, payload):
         ).fetchone()
     )
     observe = turn and (
-        first or tool or event in {"UserPromptSubmit", "Stop", "SessionEnd"}
+        first or event in {"PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"}
     )
-    identity = git_identity(payload.get("cwd")) if turn else None
-    facts = None
-    if observe:
+    identity = facts = None
+    if turn:
         salt = db.execute("SELECT salt FROM install WHERE id=1").fetchone()[0]
-        facts = git_facts(payload.get("cwd"), salt)
+        facts, identity = git_observation(db, payload.get("cwd"), salt, observe=observe)
     if turn and event == "UserPromptSubmit":
         classifier = Path(os.environ.get("VANTAGE_CLASSIFIER_FILE", Path(home) / "vantage/classifier.md")).expanduser()
         context = attribution_context(facts, payload.get("cwd"), classifier, salt)
@@ -889,7 +1046,7 @@ def handle(db, name, payload):
             snapshot(
                 db,
                 key,
-                facts=facts,
+                facts=facts if observe else None,
                 changes=changes,
                 timestamp=now,
             )

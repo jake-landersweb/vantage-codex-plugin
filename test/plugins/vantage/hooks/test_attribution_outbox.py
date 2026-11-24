@@ -48,7 +48,7 @@ class HookTest(unittest.TestCase):
         classifier = self.root / "classifier.md"
         facts = {"worktree": worktree, "branch": branch, "head": head} if worktree else {}
         with patch.dict(os.environ, VANTAGE_CLASSIFIER_FILE=str(classifier)), patch.object(
-            store, "git_facts", return_value=facts
+            store, "git_observation", return_value=(facts, None)
         ), redirect_stdout(io.StringIO()) as output:
             handle(self.db, "codex", payload)
         return json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
@@ -180,6 +180,53 @@ class HookTest(unittest.TestCase):
         handle(self.db, "codex", dict(p, hook_event_name="PostModelRequest"))
         self.assertNotIn("git.user.email", self.payloads()[-1])
         self.assertNotIn("git.user.name", self.payloads()[-1])
+
+    def test_post_tool_observes_git_changes_without_spawning_git_for_stable_refs(self):
+        repo = self.root / "repo"
+        tree = self.root / "worktree"
+
+        def git(cwd, *args):
+            return subprocess.check_output(["git", "-C", cwd, *args], text=True).strip()
+
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.name", "Test User")
+        git(repo, "config", "user.email", "git@example.invalid")
+        git(repo, "remote", "add", "origin", "git@example.invalid:test/project.git")
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        git(repo, "commit", "-qm", "initial", "--allow-empty")
+        git(repo, "worktree", "add", "-q", "-b", "emily/feature", tree)
+        git(repo, "pack-refs", "--all")
+        initial = git(tree, "rev-parse", "HEAD")
+        p = {"session_id": "s", "turn_id": "t", "cwd": str(tree), "cli_version": "test"}
+        with redirect_stdout(io.StringIO()):
+            handle(self.db, "codex", dict(p, hook_event_name="UserPromptSubmit"))
+        self.db.close()
+        self.db = store.connect()
+        self.addCleanup(self.db.close)
+
+        tool = dict(p, hook_event_name="PostToolUse", tool_name="Bash")
+        with patch.object(store, "run_git", wraps=store.run_git) as run_git:
+            handle(self.db, "codex", dict(p, hook_event_name="PreToolUse", tool_name="Bash"))
+            handle(self.db, "codex", dict(tool, tool_name="update_plan"))
+            handle(self.db, "codex", tool)
+            run_git.assert_not_called()
+            git(tree, "commit", "-qm", "advance", "--allow-empty")
+            advanced = git(tree, "rev-parse", "HEAD")
+            handle(self.db, "codex", tool)
+            self.assertEqual([call.args[1] for call in run_git.call_args_list], ["rev-parse"])
+            git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/emily/feature")
+            handle(self.db, "codex", tool)
+            git(tree, "checkout", "--detach", "-q", initial)
+            handle(self.db, "codex", tool)
+
+        states = json.loads(self.payloads()[-1]["state"])["git"]
+        facts = [state["facts"] for state in states]
+        self.assertEqual([fact["head"] for fact in facts], [initial, advanced, advanced, initial])
+        self.assertEqual([fact["branch"] for fact in facts], ["emily/feature"] * 3 + [""])
+        self.assertEqual({fact["repository"] for fact in facts}, {"example.invalid/test/project"})
+        self.assertIs(facts[1]["branch_is_default"], False)
+        self.assertIs(facts[2]["branch_is_default"], True)
 
     def test_request_model_switch_survives_retry(self):
         p = {"session_id": "s", "turn_id": "t", "hook_event_name": "PostModelRequest",

@@ -32,6 +32,9 @@ the normal Codex home (`~/.codex`, or your existing `CODEX_HOME`) and merges
 the handlers into `hooks.json`. The stable launcher resolves the installed
 plugin hook. To disconnect, ask Codex to remove Vantage telemetry.
 
+If you configured telemetry with an earlier version, rerun setup and review
+the updated hooks to apply the shell and edit tool filter.
+
 The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
@@ -53,6 +56,10 @@ The tool writes through the same launcher that handles hook events. Codex can
 ask for approval for this write. For unattended runs, authorize `vantage_local.set_turn_attribution`
 in the host's tool approval settings before starting the session. When the host
 blocks the tool, new classifier tags cannot be saved.
+
+The hook checks for Git changes after shell and edit tools finish. It reuses
+local observations while the worktree's HEAD, current ref, and Git configuration
+are unchanged.
 
 Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection

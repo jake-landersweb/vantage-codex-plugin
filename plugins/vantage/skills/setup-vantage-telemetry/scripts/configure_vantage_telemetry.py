@@ -219,7 +219,8 @@ def copy_managed_hook_scripts():
 
 
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostModelRequest", "SubagentStart",
-               "PreToolUse", "PostToolUse", "Stop", "SessionEnd")
+               "PostToolUse", "Stop", "SessionEnd")
+POST_TOOL_MATCHER = r"^(Bash|Edit|Write|MultiEdit|exec_command|apply_patch|shell|shell_command)$"
 
 
 def save_connection(token):
@@ -235,9 +236,19 @@ def save_connection(token):
 def install_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
+    if "PreToolUse" in hooks:
+        remaining, changed = remove_managed_hook_handlers(hooks["PreToolUse"])
+        if changed:
+            if remaining:
+                hooks["PreToolUse"] = remaining
+            else:
+                del hooks["PreToolUse"]
     for event_name in HOOK_EVENTS:
         groups, _changed = remove_managed_hook_handlers(hooks.get(event_name, []))
-        groups.append({"hooks": [hook_handler(event_name)]})
+        group = {"hooks": [hook_handler(event_name)]}
+        if event_name == "PostToolUse":
+            group["matcher"] = POST_TOOL_MATCHER
+        groups.append(group)
         hooks[event_name] = groups
     payload["hooks"] = hooks
 
@@ -269,7 +280,7 @@ def remove_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
     changed = False
-    for event_name in HOOK_EVENTS:
+    for event_name in (*HOOK_EVENTS, "PreToolUse"):
         if event_name not in hooks:
             continue
         groups, event_changed = remove_managed_hook_handlers(hooks[event_name])
